@@ -1,4 +1,5 @@
 requests
 python-mpv-jsonipc
 numpy
+portalocker
 scipy

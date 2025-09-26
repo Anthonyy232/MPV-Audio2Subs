@@ -1,0 +1,4 @@
+/venv/
+/.idea/
+subtitle_service.log
+*.log

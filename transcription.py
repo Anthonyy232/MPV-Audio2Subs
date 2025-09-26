@@ -13,22 +13,16 @@ class TranscriptionInterface(ABC):
         pass
 
 class WhisperXWebClient(TranscriptionInterface):
-    """
-    A client that sends audio to a long-running WhisperX Docker container
-    which exposes a Flask web server.
-    """
+    """Client for communicating with the external WhisperX Flask server (Docker container)."""
     def __init__(self, server_url="http://localhost:5000"):
         self.transcribe_url = f"{server_url}/transcribe"
         self.health_url = f"{server_url}/health"
         logging.info(f"[Model] WhisperX web client initialized. Target: {server_url}")
+        # Blocks initialization until the AI model is loaded and ready.
         self._wait_for_server()
 
     def _wait_for_server(self):
-        """
-        Waits for the server to become healthy before allowing transcription.
-        This wait is necessary because the AI model loading (GPU initialization)
-        can take several minutes after the Docker container starts.
-        """
+        """Polls the health endpoint until the transcription server responds (200 OK)."""
         logging.info("[Model] Checking transcription server readiness...")
         
         max_wait_time = 300
@@ -48,15 +42,10 @@ class WhisperXWebClient(TranscriptionInterface):
         raise RuntimeError("Could not connect to the transcription server.")
 
     def transcribe(self, audio_buffer: bytes) -> list[dict]:
-        """
-        Sends audio to the WhisperX server, requesting the precise parameters
-        needed for word-level timestamps.
-        """
+        """Sends raw audio bytes to the server and requests word-level timestamps."""
         if not audio_buffer:
             return []
 
-        # These parameters are required by the WhisperX API to enable the alignment
-        # step and return the detailed 'words' array needed for professional refinement.
         data_payload = {
             'language': 'en',
             'word_timestamps': 'true'
@@ -69,10 +58,7 @@ class WhisperXWebClient(TranscriptionInterface):
             response = requests.post(self.transcribe_url, files=files, data=data_payload, timeout=60)
             response.raise_for_status()
             
-            result = response.json()
-            logging.debug(f"[API] Raw server response: {json.dumps(result, indent=2)}")
-            
-            segments = result
+            segments = response.json()
 
             if isinstance(segments, list):
                 if segments:
