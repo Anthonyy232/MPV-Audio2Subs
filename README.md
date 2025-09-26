@@ -1,6 +1,6 @@
 # MPV-Audio2Subs
 
-This project provides a high-quality, real-time transcription subtitle generation service for the MPV media player, leveraging advanced AI models (WhisperX) for transcription and alignment. It is designed to generate professionally timed subtitles for any video file as you watch it.
+This project provides a high-quality, real-time transcription subtitle generation service for the MPV media player, leveraging WhisperX for transcription and alignment. It is designed to generate professionally timed subtitles for any video file as you watch it.
 
 Languages supported: English (en)
 
