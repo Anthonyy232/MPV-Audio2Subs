@@ -20,7 +20,7 @@ from python_mpv_jsonipc import MPV, MPVError
 from ai_engine import AITranscriptionEngine
 from transcription import ParakeetLocalClient
 
-# Configure logging to file and stdout for diagnostics
+# Logging to file and stdout
 script_dir = os.path.dirname(os.path.abspath(__file__))
 log_file_path = os.path.join(script_dir, 'subtitle_service.log')
 
@@ -34,13 +34,13 @@ logging.basicConfig(
 )
 
 CLIENT_NAME = "ai_subtitle_service"
-CONFIG = {"CHUNK_DURATION_SECONDS": 30}
+CONFIG = {"CHUNK_DURATION_SECONDS": 300}
 LOCK_FILE_PATH = os.path.join(tempfile.gettempdir(), 'mpv_ai_subtitle_service.lock')
 _lock_file_handle = None
 
 
 def _is_pid_running(pid: int) -> bool:
-    """Return True if a process with the given PID exists."""
+    """True if PID exists."""
     if pid <= 0:
         return False
     if sys.platform == "win32":
@@ -54,7 +54,7 @@ def _is_pid_running(pid: int) -> bool:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
     else:
-        # Use kill -0 on Unix-like systems
+        # Use kill -0 on Unix
         try:
             os.kill(pid, 0)
         except OSError:
@@ -88,7 +88,7 @@ def acquire_lock():
             except OSError:
                 pass # Ignore if removal fails
 
-    # Attempt a platform-aware exclusive lock, fall back to pid file write
+    # Try portalocker, else write PID file
     if _HAS_PORTALOCKER and portalocker is not None:
         try:
             fh = open(LOCK_FILE_PATH, 'w', encoding='utf-8')
@@ -96,20 +96,20 @@ def acquire_lock():
             fh.write(str(os.getpid()))
             fh.flush()
             _lock_file_handle = fh
-            logging.info(f"[Lock] Acquired portalocker lock and wrote PID {os.getpid()} to {LOCK_FILE_PATH}.")
+            logging.info(f"[Lock] Portalocker lock acquired; PID written.")
             return True
         except (IOError, OSError, portalocker.exceptions.LockException) as e:
-            logging.warning(f"[Lock] Could not acquire portalocker lock: {e}")
+            logging.warning(f"[Lock] Portalocker lock failed: {e}")
             with suppress(Exception): fh.close()
             return False
     try:
         _lock_file_handle = open(LOCK_FILE_PATH, 'w', encoding='utf-8')
         _lock_file_handle.write(str(os.getpid()))
         _lock_file_handle.flush()
-        logging.info(f"[Lock] Wrote PID {os.getpid()} to {LOCK_FILE_PATH} (fallback lock).")
+        logging.info(f"[Lock] PID file written (fallback).")
         return True
     except IOError:
-        logging.critical("[Lock] Failed to write fallback lock file. Check permissions.", exc_info=True)
+        logging.critical("[Lock] Failed to write PID file.", exc_info=True)
         return False
 
 
@@ -122,14 +122,14 @@ def release_lock():
             _lock_file_handle.close()
             _lock_file_handle = None
         except Exception as e:
-            logging.warning(f"[Lock] Error releasing lock handle: {e}")
+            logging.warning(f"[Lock] Error releasing lock: {e}")
 
     if os.path.exists(LOCK_FILE_PATH):
         try:
             os.remove(LOCK_FILE_PATH)
-            logging.info("[Lock] Released lock and removed lock file.")
+            logging.info("[Lock] Lock file removed.")
         except OSError as e:
-            logging.warning(f"[Lock] Could not remove lock file on exit: {e}.")
+            logging.warning(f"[Lock] Could not remove lock file: {e}.")
 
 
 class SubtitleService:
@@ -141,7 +141,7 @@ class SubtitleService:
         self.current_engine = None
         self.observer_ids = []
         self.transcription_model = self._load_ai_model()
-        self.subtitle_file_loaded = False
+        self.ai_subtitle_track_id = None  # AI subtitle track id
 
         try:
             self.player = MPV(start_mpv=False, ipc_socket=socket_path)
@@ -151,38 +151,35 @@ class SubtitleService:
             sys.exit(1)
 
         self._setup_observers_and_events()
-        # Start a background heartbeat to detect lost MPV connection
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_worker, daemon=True, name="MPVHeartbeat")
         self.heartbeat_thread.start()
 
         logging.info(f"[Service] Python service registered as '{CLIENT_NAME}' and is ready.")
 
     def _load_ai_model(self):
-        logging.info("[Model] Initializing Parakeet Local Client...")
+        logging.info("[Model] Init Parakeet client")
         try:
             model = ParakeetLocalClient()
-            logging.info(f"[Model] AI model client '{model.__class__.__name__}' initialized successfully.")
+            logging.info(f"[Model] {model.__class__.__name__} initialized")
             return model
         except Exception as e:
             logging.critical(f"[Model] Fatal: Failed to load AI model: {e}", exc_info=True)
             sys.exit(1)
 
     def _heartbeat_worker(self):
-        """Background monitor that checks MPV connection and triggers shutdown if lost."""
-        logging.info("[Heartbeat] Heartbeat monitor started.")
+        logging.info("[Heartbeat] started")
         while self.running:
             time.sleep(2.0)
             try:
-                # Lightweight property access to validate the IPC connection
                 _ = self.player.pause
             except (MPVError, BrokenPipeError, AttributeError):
-                logging.warning("[Heartbeat] Connection to MPV lost. Triggering shutdown.")
+                logging.warning("[Heartbeat] MPV connection lost. Shutting down.")
                 self.shutdown()
                 break
-        logging.info("[Heartbeat] Heartbeat monitor stopped.")
+        logging.info("[Heartbeat] stopped")
         
     def _setup_observers_and_events(self):
-        # Bind MPV events and property observers
+        # Bind mpv events
         self.player.bind_event('shutdown', self.handle_shutdown)
         self.player.bind_event('client-message', self.handle_message)
         self.observer_ids.append(self.player.bind_property_observer('path', self._on_path_change))
@@ -191,61 +188,64 @@ class SubtitleService:
         self.player.command("script-binding", CLIENT_NAME)
 
     def run(self):
-        logging.info("[Service] Service is now running. Waiting for mpv events...")
+        logging.info("[Service] running; awaiting events")
         try:
-            # This will block until shutdown_event is set
             self.shutdown_event.wait()
         except (KeyboardInterrupt, SystemExit):
             logging.info("[Service] Received exit signal.")
         finally:
             self.shutdown()
-
         self._cleanup()
         logging.info("[Service] Python service has shut down.")
         
     def _cleanup(self):
-        logging.info("[Service] Cleaning up resources...")
+        logging.info("[Service] cleaning up")
         for engine in list(self.engines.values()):
-            # Shutdown each engine (idempotent)
             engine.shutdown()
         if self.player:
             try:
-                for obs_id in self.observer_ids: self.player.unbind_property_observer(obs_id)
+                for obs_id in self.observer_ids:
+                    self.player.unbind_property_observer(obs_id)
                 self.player.terminate()
-            except (MPVError, BrokenPipeError): pass
-            finally: self.player = None
+            except (MPVError, BrokenPipeError):
+                pass
+            finally:
+                self.player = None
 
     def _on_path_change(self, _, path: str | None):
         if self.current_engine:
-            logging.info(f"[Engine] Cleaning up old engine for '{os.path.basename(self.current_engine.video_path)}'.")
+            logging.info(f"[Engine] Cleaning old engine for '{os.path.basename(self.current_engine.video_path)}'.")
             if self.current_engine.video_path in self.engines:
                 self.engines[self.current_engine.video_path].shutdown()
                 del self.engines[self.current_engine.video_path]
 
-        self.subtitle_file_loaded = False
         self.current_engine = None
+        self.ai_subtitle_track_id = None  # reset for new video
 
         if path is None:
-            logging.info("[Video] Player stopped or file closed.")
+            logging.info("[Video] stopped or closed")
             return
 
-        logging.info(f"[Video] New video loaded: {os.path.basename(path)}")
+        logging.info(f"[Video] loaded: {os.path.basename(path)}")
         if path not in self.engines:
             try:
                 video_params = self.player.video_params
                 video_metadata = {
-                    'path': path, 'duration': self.player.duration, 'filename': self.player.filename,
-                    'width': video_params.get('w'), 'height': video_params.get('h')
+                    'path': path,
+                    'duration': self.player.duration,
+                    'filename': self.player.filename,
+                    'width': video_params.get('w'),
+                    'height': video_params.get('h')
                 }
                 self.engines[path] = AITranscriptionEngine(
                     video_metadata, CONFIG, self.transcription_model, self._on_subtitle_update
                 )
-                logging.info(f"[Engine] Created new transcription engine for '{os.path.basename(path)}'.")
+                logging.info(f"[Engine] New transcription engine for '{os.path.basename(path)}'.")
             except (RuntimeError, MPVError, BrokenPipeError) as e:
-                logging.error(f"[Engine] Failed to initialize engine: {e}")
+                logging.error(f"[Engine] Init failed: {e}")
                 return
         else:
-            logging.info(f"[Engine] Reusing existing transcription engine for '{os.path.basename(path)}'.")
+            logging.info(f"[Engine] Reusing engine for '{os.path.basename(path)}'.")
 
         self.current_engine = self.engines[path]
         self._on_subtitle_update(self.current_engine.subtitle_path)
@@ -258,28 +258,74 @@ class SubtitleService:
 
     def _on_pause_change(self, _, is_paused: bool):
         if self.current_engine and not self.current_engine.is_finished.is_set():
-            logging.info(f"[Playback] Playback {'paused' if is_paused else 'resumed'}.")
+            logging.info(f"[Playback] {'paused' if is_paused else 'resumed'}")
             if not is_paused:
                 self.current_engine.process_update(self.player.time_pos)
 
-    def _on_subtitle_update(self, subtitle_path: str):
-        if not os.path.exists(subtitle_path):
-            return
+    def _get_ai_subtitle_track(self, subtitle_path: str) -> dict | None:
         try:
-            if not self.subtitle_file_loaded:
-                self.player.sub_add(subtitle_path)
-                logging.info(f"[Sub] Added new AI subtitle file: {os.path.basename(subtitle_path)}")
-                self.subtitle_file_loaded = True
+            abs_subtitle_path = os.path.abspath(subtitle_path)
+            for track in self.player.track_list:
+                if track.get('type') == 'sub':
+                    track_filename = track.get('external-filename')
+                    if track_filename and os.path.abspath(track_filename) == abs_subtitle_path:
+                        return track
+        except (MPVError, BrokenPipeError, AttributeError) as e:
+            logging.warning(f"[MPV] Could not query track list: {e}")
+        return None
+
+    def _on_subtitle_update(self, subtitle_path: str):
+        """
+        Add or reload the AI subtitle track, respecting the user's current selection.
+        If subtitles are disabled, it adds the track without selecting it.
+        If subtitles are enabled, it adds and selects the track.
+        If the track already exists, it just reloads the content.
+        """
+        if not self.player or not os.path.exists(subtitle_path):
+            return
+
+        try:
+            # If we already know the track ID, just reload it
+            if self.ai_subtitle_track_id is not None:
+                logging.debug(f"[Sub] Reloading AI track id={self.ai_subtitle_track_id}.")
+                self.player.sub_reload(self.ai_subtitle_track_id)
+                return
+
+            # If ID is unknown, find the track or add it for the first time ---
+            ai_track = self._get_ai_subtitle_track(subtitle_path)
+
+            if ai_track:
+                # The track is already loaded but we didn't have its ID. Store it now.
+                self.ai_subtitle_track_id = ai_track.get('id')
+                logging.info(f"[Sub] Found existing AI track, stored id={self.ai_subtitle_track_id}")
+                self.player.sub_reload(self.ai_subtitle_track_id)
             else:
-                logging.info("[Sub] Subtitle file has been updated. Reloading.")
-                self.player.sub_reload()
+                # The track is not loaded. We need to add it.
+                is_sub_active = self.player.sid != 'no' and self.player.sub_visibility
+
+                # If subtitles are active, we'll select our new track
+                add_flag = 'select' if is_sub_active else 'auto'
+                logging.info(f"[Sub] Adding new AI track with flag '{add_flag}' (user subs active: {is_sub_active}).")
+                self.player.sub_add(subtitle_path, add_flag)
+
+                # Give mpv a moment to process before we query for the new track's ID
+                time.sleep(0.2)
+
+                # Now, find the newly added track to get its ID for future reloads
+                newly_added_track = self._get_ai_subtitle_track(subtitle_path)
+                if newly_added_track:
+                    self.ai_subtitle_track_id = newly_added_track.get('id')
+                    logging.info(f"[Sub] Successfully added AI track, stored id={self.ai_subtitle_track_id}")
+                else:
+                    logging.warning("[Sub] Could not find the AI subtitle track immediately after adding it.")
+
         except (MPVError, BrokenPipeError) as e:
-            logging.warning(f"[MPV] Failed to interact with subtitle track during update: {e}")
+            logging.warning(f"[MPV] Subtitle interaction failed: {e}")
+            self.ai_subtitle_track_id = None
         except Exception as e:
-            logging.error(f"[Sub] An unexpected error occurred during subtitle update: {e}", exc_info=True)
+            logging.error(f"[Sub] Unexpected error during subtitle update: {e}", exc_info=True)
 
     def shutdown(self):
-        """Idempotent method to initiate a graceful shutdown."""
         if self.running:
             self.running = False
             self.shutdown_event.set()

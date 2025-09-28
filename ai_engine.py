@@ -13,8 +13,6 @@ from typing import Optional, TextIO, Callable
 from transcription import TranscriptionInterface, SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH
 
 class AITranscriptionEngine:
-    # Coordinates chunked transcription and atomic subtitle updates
-
     # --- Configuration Constants ---
     IDLE_PRIORITY_OFFSET = 1000000.0
     SUBTITLE_REWRITE_THROTTLE_S = 3.00 # Batch rapid update requests to reduce IO
@@ -97,9 +95,7 @@ class AITranscriptionEngine:
         while not self.stop_worker.is_set():
             # Wait until a rewrite is needed or until timeout to check for stop signal
             if self.rewrite_needed.wait(timeout=1.0):
-                # Once signaled, clear the event immediately
                 self.rewrite_needed.clear()
-                # Then, sleep for the throttle duration to batch subsequent rapid requests
                 time.sleep(self.SUBTITLE_REWRITE_THROTTLE_S)
 
                 self._rewrite_subtitle_file()
@@ -118,7 +114,6 @@ class AITranscriptionEngine:
             self.task_queue = PriorityQueue()
             self.queued_chunks.clear()
 
-        # Unblock the writer thread if it's waiting on the event
         self.rewrite_needed.set()
 
         # Allow a brief, non-blocking join so threads can exit cleanly.
