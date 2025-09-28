@@ -2,159 +2,204 @@ import bisect
 import logging
 import math
 import os
-import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
-from abc import ABC, abstractmethod
 from queue import PriorityQueue, Empty
+from typing import Optional, TextIO, Callable
 
-import requests
-
-# --- Audio Extraction Constants ---
-# Defines the raw audio format for WhisperX compatibility.
-SAMPLE_RATE = 16000  # 16kHz
-CHANNELS = 1         # Mono
-SAMPLE_WIDTH = 2     # 16-bit PCM (s16le)
-# Calculated size of a 30-second audio chunk in bytes.
-AUDIO_CHUNK_SIZE_BYTES = 30 * SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS
-
-class TranscriptionInterface(ABC):
-    """Abstract base class for transcription models."""
-    @abstractmethod
-    def transcribe(self, audio_buffer: bytes) -> list[dict]:
-        pass
-    def close(self) -> None:
-        logging.info(f"[Model] Closing transcription model: {self.__class__.__name__}")
-        pass
-
-class WhisperXWebClient(TranscriptionInterface):
-    """Client for communicating with the external WhisperX Flask server (Docker container)."""
-    def __init__(self, server_url="http://localhost:5000"):
-        self.transcribe_url = f"{server_url}/transcribe"
-        self.health_url = f"{server_url}/health"
-        logging.info(f"[Model] WhisperX web client initialized. Target: {server_url}")
-        # Blocks initialization until the AI model is loaded and ready.
-        self._wait_for_server()
-
-    def _wait_for_server(self):
-        """Polls the health endpoint until the transcription server responds (200 OK)."""
-        logging.info("[Model] Checking transcription server readiness...")
-        
-        max_wait_time = 300
-        start_time = time.time()
-        
-        while time.time() - start_time < max_wait_time:
-            try:
-                response = requests.get(self.health_url, timeout=5)
-                if response.status_code == 200:
-                    logging.info("[Model] Transcription server is ready (200 OK).")
-                    return
-            except requests.exceptions.RequestException:
-                logging.debug("[Model] Server not yet reachable. Retrying in 2 seconds.")
-                time.sleep(2)
-        
-        logging.critical("FATAL: Transcription server did not become ready within 300 seconds.")
-        raise RuntimeError("Could not connect to the transcription server.")
-
-    def transcribe(self, audio_buffer: bytes) -> list[dict]:
-        """Sends raw audio bytes to the server and requests word-level timestamps."""
-        if not audio_buffer:
-            return []
-
-        data_payload = {
-            'language': 'en',
-            'word_timestamps': 'true'
-        }
-
-        files = {'audio': ('audio.s16le', audio_buffer, 'application/octet-stream')}
-        
-        try:
-            logging.info(f"[API] Sending {len(audio_buffer)} bytes for transcription.")
-            response = requests.post(self.transcribe_url, files=files, data=data_payload, timeout=60)
-            response.raise_for_status()
-            
-            segments = response.json()
-
-            if isinstance(segments, list):
-                if segments:
-                    logging.info(f"[API] Received {len(segments)} segments from server.")
-                else:
-                    logging.info("[API] Received empty segment list from server.")
-                return segments
-            else:
-                logging.error(f"[API] API contract violation: Server returned unexpected data type: {type(segments)}")
-                return []
-        
-        except requests.exceptions.RequestException as e:
-            logging.error(f"[API] Request failed: {e}")
-            return []
-        except requests.exceptions.JSONDecodeError as e:
-            logging.error(f"[API] JSON Decode failed: {e}. Response text snippet: {response.text[:100]}...")
-            return []
-        except Exception as e:
-            logging.error(f"[API] Unexpected error during API call: {e}", exc_info=True)
-            return []
-
+from transcription import TranscriptionInterface, SAMPLE_RATE, CHANNELS, SAMPLE_WIDTH
 
 class AITranscriptionEngine:
-    """Manages transcription tasks and subtitle generation for a single video file."""
+    # Coordinates chunked transcription and atomic subtitle updates
 
-    def __init__(self, video_metadata: dict, config: dict, on_chunk_completed_callback: callable, transcription_model: TranscriptionInterface):
+    # --- Configuration Constants ---
+    IDLE_PRIORITY_OFFSET = 1000000.0
+    SUBTITLE_REWRITE_THROTTLE_S = 3.00 # Batch rapid update requests to reduce IO
+    # --- Subtitle Rules ---
+    SUB_MIN_DURATION_S, SUB_MAX_DURATION_S, SUB_MIN_GAP_S = 0.8, 7.0, 0.15
+    SUB_MAX_CPL, SUB_PADDING_S = 42, 0.150
+    # --- ASS Style ---
+    ASS_FONT_NAME, ASS_FONT_SIZE = "Arial", 65
+    ASS_PRIMARY_COLOR, ASS_OUTLINE_COLOR = "&H00FFFFFF", "&H00000000"
+
+    def __init__(self, video_metadata: dict, config: dict, transcription_model: TranscriptionInterface, on_update_callback: Callable[[str], None]):
+        # persist video and configuration for the engine lifecycle
         self.video_path = video_metadata.get('path')
         self.video_filename = video_metadata.get('filename')
         self.duration = video_metadata.get('duration')
+        self.video_width = video_metadata.get('width')
+        self.video_height = video_metadata.get('height')
         self.config = config
-        self.on_chunk_completed = on_chunk_completed_callback
         self.transcription_model = transcription_model
+        self.on_update_callback = on_update_callback
 
         self.CHUNK_DURATION = self.config.get('CHUNK_DURATION_SECONDS', 30)
-        
-        # Calculates the correct maximum chunk index.
-        # e.g., a 60s video has chunks 0 and 1, so total_chunks (max index) is 1.
-        if self.duration > 0:
-            num_chunks = math.ceil(self.duration / self.CHUNK_DURATION)
-            self.total_chunks = int(num_chunks - 1)
-        else:
-            self.total_chunks = -1 # No chunks to process
-        
+        self.total_chunks_count = math.ceil(self.duration / self.CHUNK_DURATION) if self.duration and self.duration > 0 else 1
+        self.total_chunks_index = self.total_chunks_count - 1
+
         self.video_context = f"[Video: {self.video_filename[:15]}...]"
         self.subtitle_path = self._generate_subtitle_filepath()
-        
-        # Critical state management
+
+        # Threading primitives and shared state
+        self.is_finished = threading.Event()
+        self.stop_worker = threading.Event()
+        self.rewrite_needed = threading.Event() # Signaler to trigger batched subtitle writes
         self.subtitle_segments = []
         self.subtitle_lock = threading.Lock()
-        self.max_segment_end_time = 0.0
-        
         self.task_queue = PriorityQueue()
         self.queue_lock = threading.Lock()
-        self.processed_chunks = set()
-        self.queued_chunks = set()
-        self.last_known_time = 0.0
+        self.processed_chunks, self.queued_chunks = set(), set()
+        self.last_known_time, self.sequential_idle_pointer = 0.0, 0
+        self.audio_file_path: Optional[str] = None
+        self.audio_file_handle: Optional[TextIO] = None
 
-        # Pointer for sequential background transcription.
-        self.sequential_idle_pointer = 0
-        
-        # Audio extraction optimization
-        self.audio_file_path = None
-        # Executes FFMPEG once to extract the full audio stream to a temporary file.
         self._pre_extract_audio()
-
-        # Writes the ASS header to the file.
         self._initialize_subtitle_file()
 
-        self.worker_thread = threading.Thread(target=self._worker, daemon=True, name=f"AIEngine-{self.video_filename[:10]}")
+        # Worker threads that perform transcription and write aggregated subtitles
+        self.worker_thread = threading.Thread(target=self._worker, daemon=True, name=f"AIEngine-Worker-{self.video_filename[:10]}")
+        self.writer_thread = threading.Thread(target=self._subtitle_writer_worker, daemon=True, name=f"AIEngine-Writer-{self.video_filename[:10]}")
         self.worker_thread.start()
+        self.writer_thread.start()
+        logging.info(f"{self.video_context} Engine initialized (Duration: {self.duration:.2f}s, Chunks: {self.total_chunks_count}).")
 
-        logging.info(f"{self.video_context} Engine initialized (Duration: {self.duration:.2f}s, Chunks: {self.total_chunks + 1}).")
+    def _worker(self):
+        # Process tasks until all chunks are handled or a stop is requested
+        logging.info(f"{self.video_context} Worker thread started.")
+        while not self.stop_worker.is_set():
+            try:
+                # fast-path: exit when no more work remains
+                if len(self.processed_chunks) >= self.total_chunks_count and self.task_queue.empty():
+                    break
+
+                _, (start_time, end_time, chunk_index) = self.task_queue.get(timeout=2.0)
+                if self.stop_worker.is_set(): break
+                self._process_one_chunk(start_time, end_time, chunk_index)
+            except Empty:
+                # when idle, schedule lower-priority background chunks to fill throughput
+                if len(self.processed_chunks) >= self.total_chunks_count:
+                    break
+                else:
+                    self._queue_idle_chunk()
+
+        if not self.stop_worker.is_set():
+            logging.info(f"{self.video_context} All {len(self.processed_chunks)} chunks processed. Worker thread is shutting down.")
+            self.is_finished.set()
+        else:
+            logging.info(f"{self.video_context} Worker received stop signal.")
+
+    def _subtitle_writer_worker(self):
+        """Dedicated thread to handle throttled subtitle file writes."""
+        logging.info(f"{self.video_context} Subtitle writer thread started.")
+        while not self.stop_worker.is_set():
+            # Wait until a rewrite is needed or until timeout to check for stop signal
+            if self.rewrite_needed.wait(timeout=1.0):
+                # Once signaled, clear the event immediately
+                self.rewrite_needed.clear()
+                # Then, sleep for the throttle duration to batch subsequent rapid requests
+                time.sleep(self.SUBTITLE_REWRITE_THROTTLE_S)
+
+                self._rewrite_subtitle_file()
+
+        logging.info(f"{self.video_context} Writer received stop signal, performing final write.")
+        # Perform one final, un-throttled write to flush all pending changes
+        if len(self.subtitle_segments) > 0:
+            self._rewrite_subtitle_file()
+
+    def shutdown(self):
+        """Stop threads and flush subtitle writes safely."""
+        logging.info(f"{self.video_context} Shutdown requested for engine.")
+        self.stop_worker.set()
+        # Clear queued tasks to unblock the worker quickly.
+        with self.queue_lock:
+            self.task_queue = PriorityQueue()
+            self.queued_chunks.clear()
+
+        # Unblock the writer thread if it's waiting on the event
+        self.rewrite_needed.set()
+
+        # Allow a brief, non-blocking join so threads can exit cleanly.
+        self.worker_thread.join(timeout=1.5)
+        self.writer_thread.join(timeout=1.5)
+
+        self._cleanup()
+
+    def _rewrite_subtitle_file(self):
+        # Atomically update subtitle file to avoid partial reads by the player
+        header = self._get_ass_header()
+
+        # Prevent race condition on self.subtitle_segments while creating the lines
+        with self.subtitle_lock:
+            dialogue_lines = [
+                f"Dialogue: 0,{self._format_ass_timestamp(start)},{self._format_ass_timestamp(end)},Default,,0,0,0,,{text}"
+                for start, end, text in self.subtitle_segments
+            ]
+        content = header + "\n" + "\n".join(dialogue_lines) + "\n"
+
+        temp_subtitle_path = self.subtitle_path + ".tmp"
+
+        try:
+            with open(temp_subtitle_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            os.replace(temp_subtitle_path, self.subtitle_path)
+            # Notify the main service about subtitle updates for immediate reload
+            self.on_update_callback(self.subtitle_path)
+        except Exception as e:
+            logging.error(f"{self.video_context} An unexpected error occurred during subtitle rewrite: {e}", exc_info=True)
+            if os.path.exists(temp_subtitle_path):
+                os.remove(temp_subtitle_path)
+
+    def _process_one_chunk(self, start_time: float, end_time: float, chunk_index: int):
+        # Convert audio chunk to timestamped subtitles and insert them safely
+        try:
+            audio_buffer = self._extract_audio_chunk(start_time, end_time)
+            if not audio_buffer:
+                return
+
+            transcription_data = self.transcription_model.transcribe(audio_buffer)
+            # If a shutdown was requested during transcription, abort post-processing.
+            if self.stop_worker.is_set():
+                logging.info(f"{self.video_context} Stop signal received mid-chunk. Aborting post-processing.")
+                return
+
+            if not transcription_data or not transcription_data.get('words'):
+                return
+
+            refined_segments = self._apply_subtitle_rules(transcription_data)
+
+            new_segments_added = 0
+            # hold lock only while mutating shared subtitle list to minimize blocking
+            with self.subtitle_lock:
+                for item in refined_segments:
+                    abs_start = start_time + item['start']
+                    abs_end = start_time + item['end']
+                    text = item['text'].strip()
+                    if not text: continue
+
+                    new_segment = (abs_start, abs_end, text)
+                    bisect.insort(self.subtitle_segments, new_segment)
+                    new_segments_added += 1
+
+            if new_segments_added > 0:
+                logging.info(f"{self.video_context} Added {new_segments_added} segments from chunk {chunk_index}. Total: {len(self.subtitle_segments)}.")
+                # Signal the writer thread instead of writing directly to avoid IO on worker threads
+                self.rewrite_needed.set()
+        except Exception as e:
+            logging.error(f"{self.video_context} Critical error during chunk processing ({start_time:.2f}s): {e}", exc_info=True)
+        finally:
+            with self.queue_lock:
+                self.queued_chunks.discard(start_time)
+                self.processed_chunks.add(start_time)
+            self.task_queue.task_done()
 
     def _cleanup(self):
-        """Removes the temporary raw audio file."""
-        self._cleanup_audio_file()
-
-    def _cleanup_audio_file(self):
-        """Deletes the temporary audio file if it exists."""
+        # Remove temporary audio artifacts to free disk and memory
+        if self.audio_file_handle:
+            self.audio_file_handle.close()
+            self.audio_file_handle = None
         if self.audio_file_path and os.path.exists(self.audio_file_path):
             try:
                 os.remove(self.audio_file_path)
@@ -164,39 +209,59 @@ class AITranscriptionEngine:
         self.audio_file_path = None
 
     def _pre_extract_audio(self):
-        """Extracts the entire video audio track to a temporary raw PCM file.
-        This eliminates repeated FFMPEG process launches during chunk processing."""
-        self.audio_file_path = os.path.join(tempfile.gettempdir(), f"ai_audio_{os.getpid()}_{threading.get_ident()}.raw")
-        
+        # Pre-extract full audio to enable efficient random-access reads
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as fp:
+            self.audio_file_path = fp.name
+
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         command = [
             'ffmpeg', '-y', '-i', self.video_path,
             '-vn', '-acodec', 'pcm_s16le', '-ar', str(SAMPLE_RATE), '-ac', str(CHANNELS),
             '-f', 's16le', self.audio_file_path
         ]
-        
         logging.info(f"{self.video_context} Starting full audio extraction to {os.path.basename(self.audio_file_path)}...")
         try:
-            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            process.wait(timeout=self.duration * 2)
-            
-            if process.returncode != 0:
-                logging.error(f"{self.video_context} FFMPEG failed during full audio extraction (Return code: {process.returncode}).")
-                self._cleanup_audio_file()
-                raise RuntimeError("Audio extraction failed.")
-            
-            logging.info(f"{self.video_context} Full audio extraction complete.")
-        except (subprocess.CalledProcessError, FileNotFoundError, TimeoutError) as e:
-            logging.critical(f"{self.video_context} FFMPEG execution failed during pre-extraction: {e}")
-            self._cleanup_audio_file()
-            raise RuntimeError("FFMPEG pre-extraction failed.")
+            timeout = self.duration * 1.5 if self.duration and self.duration > 0 else 600
+            subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=True, creationflags=creationflags)
+            self.audio_file_handle = open(self.audio_file_path, 'rb')
+            logging.info(f"{self.video_context} Full audio extraction complete and file is open for reading.")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            stderr = e.stderr if hasattr(e, 'stderr') else 'Timeout'
+            logging.critical(f"{self.video_context} FFMPEG pre-extraction failed: {stderr}")
+            self._cleanup()
+            raise RuntimeError("Audio extraction failed.") from e
+        except Exception as e:
+            logging.critical(f"{self.video_context} FFMPEG pre-extraction failed with an unexpected error: {e}")
+            self._cleanup()
+            raise RuntimeError("Audio extraction failed.") from e
 
-    def get_max_segment_end_time(self) -> float:
-        """Returns the end time of the latest transcribed segment."""
-        with self.subtitle_lock:
-            return self.max_segment_end_time
+    def _get_ass_header(self) -> str:
+        # Build ASS header aligned to player resolution and chosen style
+        header_lines = ["[Script Info]", "Title: AI Generated Subtitles", "ScriptType: v4.00+"]
+        if self.video_width and self.video_height:
+            header_lines.extend([f"PlayResX: {self.video_width}", f"PlayResY: {self.video_height}"])
+
+        style_line = (f"Style: Default,{self.ASS_FONT_NAME},{self.ASS_FONT_SIZE},{self.ASS_PRIMARY_COLOR},&H000000FF,{self.ASS_OUTLINE_COLOR},"
+                      "&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1")
+
+        header_lines.extend(["", "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            style_line, "", "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"])
+        return "\n".join(header_lines)
+
+    def _initialize_subtitle_file(self):
+        # Create initial subtitle file so the player can load a placeholder immediately
+        header = self._get_ass_header()
+        try:
+            with self.subtitle_lock:
+                with open(self.subtitle_path, 'w', encoding='utf-8') as f: f.write(header)
+            logging.info(f"{self.video_context} Initialized new subtitle file: '{os.path.basename(self.subtitle_path)}'")
+        except IOError as e:
+            logging.error(f"{self.video_context} Failed to initialize subtitle file: {e}", exc_info=True)
 
     def _format_ass_timestamp(self, total_seconds: float) -> str:
-        """Formats seconds into the ASS timestamp format (H:MM:SS.CC)."""
+        # Format seconds into ASS timestamp with centiseconds precision
         centiseconds = int((total_seconds % 1) * 100)
         total_seconds = int(total_seconds)
         seconds = total_seconds % 60
@@ -205,385 +270,137 @@ class AITranscriptionEngine:
         return f"{hours}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
 
     def _generate_subtitle_filepath(self) -> str:
-        """Generates the path for the output ASS subtitle file."""
+        # Save generated subtitle beside the video so MPV auto-loads it
         base_name = os.path.splitext(self.video_path)[0]
         return f"{base_name}.ai.ass"
 
-    def _initialize_subtitle_file(self):
-        """Writes the required ASS header to the subtitle file."""
-        header = (
-            "[Script Info]\nTitle: AI Generated Subtitles\nScriptType: v4.00+\n\n"
-            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n"
-            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-        )
-        try:
-            with self.subtitle_lock:
-                with open(self.subtitle_path, 'w', encoding='utf-8') as f:
-                    f.write(header)
-            logging.info(f"{self.video_context} Initialized new subtitle file: '{os.path.basename(self.subtitle_path)}'")
-        except IOError as e:
-            logging.error(f"{self.video_context} Failed to initialize subtitle file: {e}", exc_info=True)
-
-    def _clear_queue_on_seek(self):
-        """Clears the task queue and resets the idle pointer after a large seek."""
-        with self.queue_lock:
-            while not self.task_queue.empty():
-                try: self.task_queue.get_nowait()
-                except Empty: break
-            self.queued_chunks.clear()
-            self.sequential_idle_pointer = 0
-            logging.info(f"{self.video_context} Seek detected. Task queue cleared.")
-
     def process_update(self, current_time: float):
-        """Updates the task queue based on the current playback position."""
+        # Prioritize transcription around the current playback position for responsiveness
         if current_time is None: return
-
         if abs(current_time - self.last_known_time) > self.CHUNK_DURATION:
-            logging.info(f"{self.video_context} Large seek detected from {self.last_known_time:.2f}s to {current_time:.2f}s. Resetting queue.")
-            self._clear_queue_on_seek()
+            logging.info(f"{self.video_context} Large seek detected. Clearing active processing queue.")
+            with self.queue_lock:
+                self._clear_task_queue()
 
         self.last_known_time = current_time
-
-        active_horizon = [-1, 0, 1, 2, 3]
         current_chunk_index = int(current_time / self.CHUNK_DURATION)
-
-        for offset in active_horizon:
+        for offset in range(-1, 4):
             chunk_index = current_chunk_index + offset
-            if not (0 <= chunk_index <= self.total_chunks):
-                continue
+            if not (0 <= chunk_index <= self.total_chunks_index): continue
 
             chunk_start_time = chunk_index * self.CHUNK_DURATION
-
             with self.queue_lock:
                 if chunk_start_time in self.processed_chunks or chunk_start_time in self.queued_chunks:
                     continue
 
                 priority = abs(chunk_start_time - current_time)
                 chunk_end_time = min(chunk_start_time + self.CHUNK_DURATION, self.duration)
-
-                logging.info(f"{self.video_context} Queueing ACTIVE chunk {chunk_index} ({chunk_start_time:.2f}s) with priority {priority:.2f}")
+                logging.debug(f"{self.video_context} Queueing ACTIVE chunk {chunk_index} ({chunk_start_time:.2f}s) with P={priority:.2f}")
                 self.queued_chunks.add(chunk_start_time)
                 self.task_queue.put((priority, (chunk_start_time, chunk_end_time, chunk_index)))
 
-    def _worker(self):
-        """The main worker loop that processes transcription tasks."""
-        logging.info(f"{self.video_context} Worker thread started.")
-        while True:
+    def _clear_task_queue(self):
+        """Empties the task queue. Must be called within queue_lock."""
+        old_queue = self.task_queue
+        self.task_queue = PriorityQueue()
+        self.queued_chunks.clear()
+
+        # Re-queue idle tasks that were cleared so background progress resumes
+        while not old_queue.empty():
             try:
-                priority, (start_time, end_time, chunk_index) = self.task_queue.get(timeout=2.0)
-                logging.info(f"{self.video_context} Processing task: Chunk {chunk_index} at {start_time:.2f}s (P={priority:.2f})")
-                self._process_one_chunk(start_time, end_time, chunk_index)
+                priority, task = old_queue.get_nowait()
+                if priority >= self.IDLE_PRIORITY_OFFSET:
+                    self.task_queue.put((priority, task))
+                    self.queued_chunks.add(task[0]) # task[0] is start_time
             except Empty:
-                logging.debug(f"{self.video_context} Queue empty. Attempting to queue idle chunk.")
-                self._queue_idle_chunk()
+                break
 
     def _queue_idle_chunk(self):
-        """Queues the next sequential chunk that has not yet been processed."""
+        # Backgroundly schedule remaining chunks to avoid impacting playback
         with self.queue_lock:
-            if self.sequential_idle_pointer > self.total_chunks:
-                return
+            while self.sequential_idle_pointer <= self.total_chunks_index:
+                start_time = self.sequential_idle_pointer * self.CHUNK_DURATION
+                if start_time not in self.processed_chunks and start_time not in self.queued_chunks:
+                    chunk_index = self.sequential_idle_pointer
+                    end_time = min(start_time + self.CHUNK_DURATION, self.duration)
+                    priority = self.IDLE_PRIORITY_OFFSET + chunk_index
+                    logging.debug(f"{self.video_context} Queueing IDLE chunk {chunk_index} ({start_time:.2f}s) with P={priority:.2f}")
+                    self.queued_chunks.add(start_time)
+                    self.task_queue.put((priority, (start_time, end_time, chunk_index)))
+                    self.sequential_idle_pointer += 1
+                    return
+                self.sequential_idle_pointer += 1
 
-            chunk_index = self.sequential_idle_pointer
-            start_time = chunk_index * self.CHUNK_DURATION
-            
-            while start_time in self.processed_chunks and chunk_index <= self.total_chunks:
-                chunk_index += 1
-                start_time = chunk_index * self.CHUNK_DURATION
-            
-            if chunk_index > self.total_chunks:
-                return
-
-            self.sequential_idle_pointer = chunk_index + 1
-            
-            end_time = min(start_time + self.CHUNK_DURATION, self.duration)
-            priority = 1000000.0 + chunk_index
-
-            logging.info(f"{self.video_context} Queueing IDLE chunk {chunk_index} ({start_time:.2f}s) with priority {priority:.2f}")
-            self.queued_chunks.add(start_time)
-            self.task_queue.put((priority, (start_time, end_time, chunk_index)))
-
-    def _extract_audio_chunk(self, start_time: float, end_time: float) -> bytes | None:
-        """
-        Reads audio bytes from the pre-extracted file. If the chunk is shorter
-        than the standard chunk duration (i.e., it's the last chunk), it is
-        padded with silence to ensure the model receives a consistent input size.
-        """
-        if not self.audio_file_path or not os.path.exists(self.audio_file_path):
-            logging.error(f"{self.video_context} Cannot extract chunk: Audio file not available.")
+    def _extract_audio_chunk(self, start_time: float, end_time: float) -> Optional[bytes]:
+        # Read byte-aligned audio slices to preserve frame integrity
+        if not self.audio_file_handle:
+            logging.error(f"{self.video_context} Cannot extract chunk: Audio file handle is not available.")
             return None
 
-        # Calculate byte offset and size based on time and audio format constants.
-        start_offset_bytes = int(start_time * SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS)
-        duration_seconds = end_time - start_time
-        size_bytes = int(duration_seconds * SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS)
-        
+        bytes_per_sample_frame = SAMPLE_WIDTH * CHANNELS
+        start_offset = int(start_time * SAMPLE_RATE) * bytes_per_sample_frame
+        num_bytes_to_read = int((end_time - start_time) * SAMPLE_RATE) * bytes_per_sample_frame
+
+        if num_bytes_to_read <= 0:
+            return None
+
         try:
-            with open(self.audio_file_path, 'rb') as f:
-                f.seek(start_offset_bytes)
-                audio_bytes = f.read(size_bytes)
-            
-            # Define the target size for a full chunk.
-            target_size_bytes = int(self.CHUNK_DURATION * SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS)
-
-            # If the extracted audio is shorter than a full chunk, pad it with silence.
-            if len(audio_bytes) < target_size_bytes:
-                bytes_to_pad = target_size_bytes - len(audio_bytes)
-                # Create a silence buffer (bytes of zeros).
-                silence = b'\x00' * bytes_to_pad
-                audio_bytes += silence
-                logging.info(f"{self.video_context} Padded final chunk with {bytes_to_pad} bytes of silence.")
-
-            logging.debug(f"{self.video_context} Extracted {len(audio_bytes)} bytes from temp file (post-padding).")
-            return audio_bytes
-        except IOError as e:
-            logging.error(f"{self.video_context} Failed to read audio chunk from temp file: {e}")
+            self.audio_file_handle.seek(start_offset)
+            audio_buffer = self.audio_file_handle.read(num_bytes_to_read)
+            return audio_buffer
+        except (IOError, ValueError) as e:
+            logging.error(f"{self.video_context} Failed to read audio chunk from temp file: {e}", exc_info=True)
             return None
 
-    def _refine_and_resegment(self, original_results: list[dict]) -> list[dict]:
-        """
-        Transforms raw ASR results into professional-grade subtitle segments.
+    def _apply_subtitle_rules(self, transcription_data: dict) -> list[dict]:
+        # Adjust timing and line breaks to improve subtitle readability
+        words = transcription_data.get('words', [])
+        if not words: return []
 
-        This multi-pass pipeline applies a series of rules to ensure readability,
-        correct timing, and adherence to subtitling standards. The order of
-        operations is critical, as later passes refine or correct the output
-        of earlier ones.
+        initial_segments = []
+        current_line_words = []
 
-        Pass 1: Re-segment based on CPL and pauses.
-        Pass 2: Correct trailing silences using word-level timestamps.
-        Pass 3: Enforce minimum/maximum duration and reading speed (CPS).
-        Pass 4: Prevent overlapping segments.
-        Pass 5: Final validation and cleanup.
-        """
-        # --- Subtitling Standards & Configuration ---
-        CPS_RATE = 15          # Characters Per Second reading speed.
-        MAX_CPL = 42           # Max Characters Per Line.
-        MIN_DURATION_S = 1.0   # Minimum time a subtitle should be on screen.
-        MAX_DURATION_S = 7.0   # Maximum time a subtitle should be on screen.
-        PAUSE_THRESHOLD_S = 0.5 # A pause in speech long enough to justify a new subtitle.
-        MIN_GAP_S = 0.15       # Minimum silent gap between consecutive subtitles.
-        START_CUSHION_S = 0.15 # Time to add before a word starts for better sync.
-        END_CUSHION_S = 0.10   # Time to add after a word ends for better sync.
+        for i, word_info in enumerate(words):
+            current_line_words.append(word_info)
+            current_text = " ".join(w['word'] for w in current_line_words)
 
-        # --- PASS 1: Re-segment long sentences into readable lines ---
-        # The model may return one long segment for a full sentence. We must break
-        # it down into lines that fit on screen and are timed to speech.
-        intermediate_segments = []
-        for segment in original_results:
-            if 'words' not in segment or not segment['words']:
-                continue
+            is_last_word = (i == len(words) - 1)
+            punct_break = any(p in word_info['word'] for p in ".?!")
+            cpl_exceeded = len(current_text) > self.SUB_MAX_CPL
 
-            words = segment['words']
-            current_line_words = []
+            if is_last_word or punct_break or cpl_exceeded:
+                if cpl_exceeded and len(current_line_words) > 1:
+                    segment_words = current_line_words[:-1]
+                    current_line_words = current_line_words[-1:]
+                else:
+                    segment_words = current_line_words
+                    current_line_words = []
 
-            for i, word_data in enumerate(words):
-                if not all(k in word_data for k in ['word', 'start', 'end']):
+                if not segment_words:
                     continue
 
-                potential_line_words = current_line_words + [word_data]
-                potential_text = " ".join([w['word'].strip() for w in potential_line_words])
-                
-                # Check for split conditions
-                is_cpl_violated = len(potential_text) > MAX_CPL
-                is_pause_split = False
-                if current_line_words:
-                    prev_word_end = current_line_words[-1]['end']
-                    current_word_start = word_data['start']
-                    if (current_word_start - prev_word_end) > PAUSE_THRESHOLD_S:
-                        is_pause_split = True
+                text = " ".join(w['word'] for w in segment_words)
+                start_time = segment_words[0]['start']
+                end_time = segment_words[-1]['end']
+                initial_segments.append({'text': text, 'start': start_time, 'end': end_time})
 
-                if current_line_words and (is_cpl_violated or is_pause_split):
-                    # Finalize the previous line and start a new one
-                    text = " ".join([w['word'].strip() for w in current_line_words])
-                    start_time = current_line_words[0]['start'] - START_CUSHION_S
-                    end_time = current_line_words[-1]['end'] + END_CUSHION_S
-                    intermediate_segments.append({'start': start_time, 'end': end_time, 'text': text, 'words': current_line_words})
-                    current_line_words = [word_data]
-                else:
-                    current_line_words = potential_line_words
-            
-            # Add the last remaining line
-            if current_line_words:
-                text = " ".join([w['word'].strip() for w in current_line_words])
-                start_time = current_line_words[0]['start'] - START_CUSHION_S
-                end_time = current_line_words[-1]['end'] + END_CUSHION_S
-                intermediate_segments.append({'start': start_time, 'end': end_time, 'text': text, 'words': current_line_words})
+        if not initial_segments: return []
 
-        if not intermediate_segments:
-            return []
-        
-        final_segments = intermediate_segments
+        processed_segments = []
+        for i, seg in enumerate(initial_segments):
+            seg['start'] = max(0.0, seg['start'] - self.SUB_PADDING_S)
+            seg['end'] += self.SUB_PADDING_S
+            if seg['end'] - seg['start'] < self.SUB_MIN_DURATION_S: seg['end'] = seg['start'] + self.SUB_MIN_DURATION_S
+            if seg['end'] - seg['start'] > self.SUB_MAX_DURATION_S: seg['end'] = seg['start'] + self.SUB_MAX_DURATION_S
+            if processed_segments:
+                prev_end = processed_segments[-1]['end']
+                if seg['start'] < prev_end + self.SUB_MIN_GAP_S: seg['start'] = prev_end + self.SUB_MIN_GAP_S
+            if seg['end'] <= seg['start']: continue
 
-        # --- PASS 2: Intelligent End-Time Correction ---
-        # Corrects segments where the model included a long trailing silence. This is
-        # common with short, sharp phrases (e.g., "Okay."). We use the end time of
-        # the last word as a more accurate anchor. This must run before duration enforcement.
-        for seg in final_segments:
-            text_len = len(seg['text'])
-            current_duration = seg['end'] - seg['start']
-            
-            # Heuristic: A short phrase with a disproportionately long duration.
-            if text_len < 15 and current_duration > (text_len * 0.4):
-                if seg['words']:
-                    # Calculate a more accurate end time based on the last spoken word.
-                    target_end = seg['words'][-1]['end'] + END_CUSHION_S
-                    
-                    # Only apply the correction if it's a significant reduction (>100ms).
-                    if target_end < seg['end'] - 0.1:
-                        seg['end'] = target_end
+            if len(seg['text']) > self.SUB_MAX_CPL:
+                split_point = seg['text'].rfind(' ', 0, self.SUB_MAX_CPL)
+                if split_point != -1: seg['text'] = f"{seg['text'][:split_point]}\\N{seg['text'][split_point+1:]}"
 
-        # --- PASS 3: Enforce Duration and Reading Speed Rules ---
-        # Ensures every subtitle is readable and doesn't linger too long.
-        for seg in final_segments:
-            num_chars = len(seg['text'])
-            current_duration = seg['end'] - seg['start']
-            
-            # Calculate minimum required duration based on CPS and absolute minimum.
-            required_cps_duration = num_chars / CPS_RATE
-            target_duration = max(current_duration, required_cps_duration, MIN_DURATION_S)
-            
-            # Cap the duration to the maximum allowed.
-            final_duration = min(target_duration, MAX_DURATION_S)
+            processed_segments.append(seg)
 
-            # Extend the end time if the new duration is longer.
-            if final_duration > current_duration:
-                seg['end'] = seg['start'] + final_duration
-
-        # --- PASS 4: Prevent Overlaps ---
-        # Ensures a minimum silent gap between consecutive subtitles for clean presentation.
-        for i in range(len(final_segments) - 1):
-            current_seg = final_segments[i]
-            next_seg = final_segments[i+1]
-            
-            # If the current segment's end time is too close to the next one's start...
-            if current_seg['end'] > (next_seg['start'] - MIN_GAP_S):
-                #...snap it back to create the required gap.
-                current_seg['end'] = next_seg['start'] - MIN_GAP_S
-
-        # --- PASS 5: Final Sanity Check and Validation ---
-        # This is a critical safety net to catch any invalid timings created by
-        # the previous passes (e.g., negative start times or durations).
-        for seg in final_segments:
-            # Clamp start time to 0.0 to avoid negative values.
-            seg['start'] = max(0.0, seg['start'])
-            
-            # If a segment now has a zero or negative duration (e.g., from overlap
-            # prevention), give it the minimum allowed duration.
-            if seg['end'] <= seg['start']:
-                seg['end'] = seg['start'] + MIN_DURATION_S
-                
-        return final_segments
-
-    def _rewrite_subtitle_file(self):
-        """Rewrites the entire subtitle file, including the header and all current segments.
-        
-        This method is called to ensure chronological order and prevent duplication after
-        new segments are added. It assumes the caller is already holding self.subtitle_lock.
-        """
-        header = (
-            "[Script Info]\nTitle: AI Generated Subtitles\nScriptType: v4.00+\n\n"
-            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-            "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n"
-            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-        )
-        dialogue_lines = []
-        for start, end, text in self.subtitle_segments:
-            start_str = self._format_ass_timestamp(start)
-            end_str = self._format_ass_timestamp(end)
-            # The text is already cleaned, so we only need to remove potential newlines for ASS format.
-            formatted_text = text.replace('\n', ' ')
-            dialogue_lines.append(f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{formatted_text}")
-        content = header + "\n" + "\n".join(dialogue_lines) + "\n"
-        
-        try:
-            with open(self.subtitle_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            logging.debug(f"{self.video_context} Subtitle file rewritten. Total segments: {len(self.subtitle_segments)}.")
-        except IOError as e:
-            logging.error(f"{self.video_context} Failed to rewrite subtitle file: {e}", exc_info=True)
-
-    def _clean_and_format_text(self, text: str) -> str:
-        """
-        Cleans and standardizes raw transcribed text for better subtitle readability.
-        
-        This process includes:
-        1. Normalizing whitespace.
-        2. Capitalizing standalone "i" and common contractions (e.g., "i'm" -> "I'm").
-        3. Capitalizing the first letter of the entire subtitle line.
-        4. Standardizing ellipses.
-        5. Correcting spacing before common punctuation marks.
-        """
-        if not text or not text.strip():
-            return ""
-
-        # Normalize whitespace: collapses multiple spaces, strips leading/trailing space.
-        cleaned_text = " ".join(text.split())
-
-        # Capitalize standalone "i" and common contractions using case-insensitive regex.
-        # The `\b` ensures we match whole words only.
-        cleaned_text = re.sub(r"\bi'm\b", "I'm", cleaned_text, flags=re.IGNORECASE)
-        cleaned_text = re.sub(r"\bi've\b", "I've", cleaned_text, flags=re.IGNORECASE)
-        cleaned_text = re.sub(r"\bi'd\b", "I'd", cleaned_text, flags=re.IGNORECASE)
-        cleaned_text = re.sub(r"\bi'll\b", "I'll", cleaned_text, flags=re.IGNORECASE)
-        cleaned_text = re.sub(r'\bi\b', 'I', cleaned_text, flags=re.IGNORECASE)
-
-        # Capitalize the first letter of the entire subtitle line.
-        if cleaned_text:
-            cleaned_text = cleaned_text[0].upper() + cleaned_text[1:]
-
-        # Standardize ellipses for better typography.
-        cleaned_text = cleaned_text.replace('...', '…')
-
-        # Correct spacing before common punctuation marks.
-        for punc in [',', '.', '?', '!', '…']:
-            cleaned_text = cleaned_text.replace(f' {punc}', punc)
-
-        return cleaned_text
-
-    def _process_one_chunk(self, start_time: float, end_time: float, chunk_index: int):
-        """Handles the full transcription pipeline for a single audio chunk."""
-        MIN_DURATION_S = 1.0
-        try:
-            audio_buffer = self._extract_audio_chunk(start_time, end_time)
-            if not audio_buffer:
-                logging.warning(f"{self.video_context} Skipping chunk {start_time:.2f}s due to missing audio buffer.")
-                return
-            original_results = self.transcription_model.transcribe(audio_buffer)
-            if not original_results:
-                logging.info(f"{self.video_context} No transcription results found for chunk {start_time:.2f}s.")
-                return
-            refined_results = self._refine_and_resegment(original_results)
-            
-            with self.subtitle_lock:
-                latest_end_time_in_chunk = 0.0
-                for item in refined_results:
-                    abs_start = start_time + item['start']
-                    abs_end = start_time + item['end']
-                    
-                    cleaned_text = self._clean_and_format_text(item['text'])
-                    if not cleaned_text:
-                        continue # Skip segments that become empty after cleaning.
-                    
-                    if abs_end <= abs_start:
-                        abs_end = abs_start + MIN_DURATION_S
-
-                    new_segment = (abs_start, abs_end, cleaned_text)
-                    latest_end_time_in_chunk = max(latest_end_time_in_chunk, abs_end)
-                    
-                    # Insert sorted by start time
-                    bisect.insort(self.subtitle_segments, new_segment, key=lambda x: x[0])
-                
-                if refined_results:
-                    self.max_segment_end_time = max(self.max_segment_end_time, latest_end_time_in_chunk)
-                    logging.info(f"{self.video_context} Added {len(refined_results)} segments from chunk {start_time:.2f}s. Total segments: {len(self.subtitle_segments)}. Max end time: {self.max_segment_end_time:.2f}s.")
-                    
-                    self._rewrite_subtitle_file()
-
-            self.on_chunk_completed(self.subtitle_path, self.max_segment_end_time)
-        except Exception as e:
-            logging.error(f"{self.video_context} Critical error during chunk transcription ({start_time:.2f}s): {e}", exc_info=True)
-        finally:
-            with self.queue_lock:
-                self.queued_chunks.discard(start_time)
-                self.processed_chunks.add(start_time)
-            self.task_queue.task_done()
+        return processed_segments

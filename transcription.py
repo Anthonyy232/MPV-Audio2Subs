@@ -1,81 +1,86 @@
 import logging
-import requests
-import time
 from abc import ABC, abstractmethod
-import json
+import numpy as np
+import torch
+
+try:
+    import nemo.collections.asr as nemo_asr
+except ImportError:
+    nemo_asr = None
+    logging.critical("NeMo toolkit not found. Please install it via 'pip install nemo_toolkit[asr]'")
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+SAMPLE_WIDTH = 2
+
 
 class TranscriptionInterface(ABC):
+    # Interface so different transcription backends can be swapped seamlessly
     @abstractmethod
-    def transcribe(self, audio_buffer: bytes) -> list[dict]:
+    def transcribe(self, audio_buffer: bytes) -> dict:
         pass
     def close(self) -> None:
         logging.info(f"[Model] Closing transcription model: {self.__class__.__name__}")
         pass
 
-class WhisperXWebClient(TranscriptionInterface):
-    """Client for communicating with the external WhisperX Flask server (Docker container)."""
-    def __init__(self, server_url="http://localhost:5000"):
-        self.transcribe_url = f"{server_url}/transcribe"
-        self.health_url = f"{server_url}/health"
-        logging.info(f"[Model] WhisperX web client initialized. Target: {server_url}")
-        # Blocks initialization until the AI model is loaded and ready.
-        self._wait_for_server()
 
-    def _wait_for_server(self):
-        """Polls the health endpoint until the transcription server responds (200 OK)."""
-        logging.info("[Model] Checking transcription server readiness...")
-        
-        max_wait_time = 300
-        start_time = time.time()
-        
-        while time.time() - start_time < max_wait_time:
-            try:
-                response = requests.get(self.health_url, timeout=5)
-                if response.status_code == 200:
-                    logging.info("[Model] Transcription server is ready (200 OK).")
-                    return
-            except requests.exceptions.RequestException:
-                logging.debug("[Model] Server not yet reachable. Retrying in 2 seconds.")
-                time.sleep(2)
-        
-        logging.critical("FATAL: Transcription server did not become ready within 300 seconds.")
-        raise RuntimeError("Could not connect to the transcription server.")
-
-    def transcribe(self, audio_buffer: bytes) -> list[dict]:
-        """Sends raw audio bytes to the server and requests word-level timestamps."""
-        if not audio_buffer:
-            return []
-
-        data_payload = {
-            'language': 'en',
-            'word_timestamps': 'true'
-        }
-
-        files = {'audio': ('audio.s16le', audio_buffer, 'application/octet-stream')}
-        
+class ParakeetLocalClient(TranscriptionInterface):
+    # NeMo-backed client intended for local, resource-efficient inference
+    def __init__(self):
+        if nemo_asr is None:
+            raise RuntimeError("NeMo toolkit is not available. Please check installation.")
+        logging.info("[Model] Initializing local Parakeet model...")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logging.info(f"[Model] Using device: {self.device}")
         try:
-            logging.info(f"[API] Sending {len(audio_buffer)} bytes for transcription.")
-            response = requests.post(self.transcribe_url, files=files, data=data_payload, timeout=60)
-            response.raise_for_status()
-            
-            segments = response.json()
-
-            if isinstance(segments, list):
-                if segments:
-                    logging.info(f"[API] Received {len(segments)} segments from server.")
-                else:
-                    logging.info("[API] Received empty segment list from server.")
-                return segments
-            else:
-                logging.error(f"[API] API contract violation: Server returned unexpected data type: {type(segments)}")
-                return []
-        
-        except requests.exceptions.RequestException as e:
-            logging.error(f"[API] Request failed: {e}")
-            return []
-        except requests.exceptions.JSONDecodeError as e:
-            logging.error(f"[API] JSON Decode failed: {e}. Response text snippet: {response.text[:100]}...")
-            return []
+            self.model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v3")
+            self.model.to(self.device)
+            logging.info("[Model] Parakeet model loaded successfully onto device.")
         except Exception as e:
-            logging.error(f"[API] Unexpected error during API call: {e}", exc_info=True)
-            return []
+            logging.critical(f"[Model] FATAL: Could not load Parakeet model. Error: {e}", exc_info=True)
+            raise RuntimeError("Failed to load Parakeet model.")
+
+    def transcribe(self, audio_buffer: bytes) -> dict:
+        # Convert raw PCM to model-ready floats and request timestamps for alignment
+        if not audio_buffer:
+            return {}
+        try:
+            audio_np = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32) / 32768.0
+
+            transcription_result = self.model.transcribe(
+                [audio_np],
+                batch_size=1,
+                timestamps=True,
+                verbose=False
+            )
+            
+            if not transcription_result or not transcription_result[0] or not transcription_result[0].timestamp:
+                logging.info("[Model] Parakeet transcription yielded no results or timestamps.")
+                return {}
+
+            word_stamps_raw = transcription_result[0].timestamp.get('word', [])
+            
+            word_stamps = [
+                {'word': w['word'], 'start': w['start'], 'end': w['end']}
+                for w in word_stamps_raw
+            ]
+
+            if not word_stamps:
+                return {'segments': [], 'words': []}
+
+            full_text = transcription_result[0].text
+            segments = [{'text': full_text, 'start': word_stamps[0]['start'], 'end': word_stamps[-1]['end']}]
+
+            logging.info(f"[Model] Parakeet processed {len(word_stamps)} words from chunk.")
+            return {'segments': segments, 'words': word_stamps}
+        except Exception as e:
+            logging.error(f"[Model] Parakeet transcription failed for a chunk: {e}", exc_info=True)
+            return {}
+
+    def close(self) -> None:
+        # Free large model resources promptly to reduce memory pressure
+        logging.info("[Model] Releasing Parakeet model from memory.")
+        del self.model
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+        super().close()

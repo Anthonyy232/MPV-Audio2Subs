@@ -1,4 +1,6 @@
+# Ignore local virtualenv, IDE settings, and runtime logs to keep repo clean
 /venv/
-/.idea/
+/idea/
+.idea
 subtitle_service.log
 *.log

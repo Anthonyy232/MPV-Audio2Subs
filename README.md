@@ -1,183 +1,145 @@
-# MPV-Audio2Subs
+# MPV-Audio2Subs: Real-Time AI Local Subtitles for MPV
 
-This project provides a high-quality, real-time transcription subtitle generation service for the MPV media player, leveraging WhisperX for transcription and alignment. It is designed to generate professionally timed subtitles for any video file as you watch it.
+A small, self-contained local service that generates high-quality, time-aligned subtitles for your videos on the fly using local Automatic Speech Recognition (ASR) models.
 
-Languages supported: English (en)
+While a video plays in MPV, the service extracts audio, transcribes it locally with a pluggable ASR backend, and writes atomic, time-aligned ASS subtitle files right next to the video.
 
-## 🚀 Features
+## ✨ Features
 
-*   **Real-Time Transcription:** Subtitles are generated chunk-by-chunk in the background while the video plays.
-*   **Seek Awareness:** The system prioritizes transcription tasks based on the current playback position and automatically clears the queue upon seeking.
-*   **Professional Refinement:** Subtitles are post-processed to adhere to professional standards (e.g., character-per-second limits, minimum/maximum duration, pause-based line splitting).
-*   **Persistent AI Backend:** Uses a persistent Docker container to keep the large AI models loaded in memory, minimizing startup time after the initial launch.
+This service is designed for responsiveness and maximum local control:
 
-## 🏗️ Architecture and Stack
+*   **100% Local Execution:** Audio extraction (via FFmpeg) and transcription occur entirely on your local machine. No data is sent to external services by default.
+*   **On-Demand Subtitles:** Transcribe any video in your library automatically after pressing a single hotkey in MPV.
+*   **Intelligent Chunking:** Uses chunked transcription with priority given to audio segments near the current playback position, significantly improving responsiveness after seeks.
+*   **Pluggable ASR Backend:** Default client uses **NVIDIA NeMo's ASR** (Parakeet models) for fast, high-quality transcription, especially when leveraging a CUDA GPU. Easily switch to other local or remote backends.
+*   **Atomic Updates:** Subtitles are saved as `<video_basename>.ai.ass` and updated atomically to ensure MPV always loads a complete, valid subtitle file.
+*   **IPC Communication:** Seamless integration with MPV via its IPC socket for audio requests, control signals, and subtitle file reload notifications.
 
-The system operates as a three-part distributed application communicating via IPC and network sockets:
+## 🚀 Installation (Quick Start)
 
-| Component | Technology | Role | Communication |
-| :--- | :--- | :--- | :--- |
-| **1. MPV Player** | C/C++, Lua | Frontend, Video Playback | IPC (JSON-IPC) |
-| **2. Service Manager** | Lua (`main.lua`) | Lifecycle Management, Docker Control | Shell/Docker CLI |
-| **3. Python Client** | Python (`main.py`) | Task Orchestration, MPV Integration | IPC (MPV Socket), HTTP (Flask) |
-| **4. AI Server** | Python, Flask, Docker, WhisperX | Heavy Lifting (Transcription, Alignment) | HTTP (localhost:5000) |
+This project requires MPV, FFmpeg, and Python 3.9+. We strongly recommend using the provided installation scripts to handle Python dependencies within a virtual environment (`venv`).
 
-### Key Libraries and Tools
+### 1. Prerequisites
 
-*   **AI/ML:** `WhisperX` (for transcription and word-level alignment).
-*   **Containerization:** `Docker` (for GPU isolation and environment consistency).
-*   **Media Processing:** `FFMPEG` (used by the Python client to extract raw audio chunks).
-*   **IPC:** `python-mpv-jsonipc` (for Python client communication with MPV).
+1.  **MPV:** Must be installed and configured with an **IPC server enabled** (see Configuration below).
+2.  **FFmpeg:** Must be available on your system `PATH` (used for fast audio extraction).
+3.  **Python 3.9+:** Required for the core transcription service.
 
-## Configuration and Performance Tuning
+### 2. Copy Files
 
-If you find the application's transcription speed too slow or resource usage too high, you can switch to a smaller Whisper model. The default model used is `large-v3`.
+Copy the entire `audio2subs` folder into MPV's user scripts directory:
 
-Available model options (e.g., `base`, `small`, `medium`) are listed in the dockerized WhisperX documentation:
-[https://github.com/jim60105/whisperX](https://github.com/jim60105/whisperX)
+*   **Linux/macOS:** `~/.config/mpv/scripts/`
+*   **Windows:** `%APPDATA%\mpv\scripts\`
 
-To change the model, you must modify the default value in the following two files:
+### 3. Run Setup Script
 
-1.  **`main.lua`**: Update the value associated with `-e` and the environment variable definition:
-    ```lua
-    WHISPER_MODEL=large-v3
-    ```
-
-2.  **`server.py`**: Update the default fallback value in the model size definition:
-    ```python
-    MODEL_SIZE = os.getenv("WHISPER_MODEL", "large-v3")
-    ```
-
-## 📋 Prerequisites
-
-Before installation, ensure you have the following installed and configured:
-
-1.  **MPV Media Player:** Must be installed.
-2.  **Docker Desktop/Daemon:** Required to run the WhisperX AI server container. Must be running before starting the service.
-3.  **FFMPEG:** Must be installed and accessible in your system's PATH.
-4.  **Python 3.9+**
-
-### Docker (Windows, Linux, macOS)
-
-This project requires Docker on all platforms (Windows, Linux, and macOS) to run the WhisperX AI server container. Installation steps vary by OS; please consult the official Docker documentation or search for platform-specific guides online.
-
-Quick verification (after installing Docker and starting the Docker daemon):
+Navigate into the copied `audio2subs` directory and run the appropriate setup script. These scripts create a local Python `venv`, install dependencies from `requirements.txt`.
 
 ```bash
-# Check Docker is available
-docker version
-
-# Run a quick test container
-docker run --rm hello-world
-```
-
-If you are on Windows you may need Docker Desktop with WSL2 integration for the best compatibility with Linux-based images. If you need platform-specific instructions, look for the official Docker installation guide for your OS.
-
-## ⚙️ Installation and Setup (Step-by-Step)
-
-This setup requires placing the project files into a specific directory structure recognized by MPV, followed by running the installation script and configuring MPV's IPC.
-
-### Step 1: Place the Project Files
-
-You must place the entire project folder, named `ai_service_manager`, into your MPV scripts directory.
-
-| Operating System | Default MPV Scripts Location |
-| :--- | :--- |
-| **Linux/macOS** | `~/.config/mpv/scripts/` |
-| **Windows** | `%APPDATA%\mpv\scripts\` or `[MPV Install Dir]\scripts\` |
-
-The final directory structure should look like this (note that `mpv_service_manager.lua` must be renamed to `main.lua`):
-
-```
-[MPV Scripts Folder]/
-└── ai_service_manager/
-    ├── ai_engine.py
-    ├── Dockerfile
-    ├── install.bat
-    ├── install.sh
-    ├── main.lua          <-- MPV's entry point for the Lua script
-    ├── main.py           <-- The Python client service
-    ├── README.md
-    ├── requirements-docker.txt
-    ├── requirements.txt
-    ├── server.py
-    └── transcription.py
-```
-
-### Step 2: Run the Installation Script
-
-Navigate into the `ai_service_manager` directory in your terminal and run the appropriate script to set up the Python virtual environment (`venv`) and install dependencies.
-
-**For Windows Users:**
-
-```bash
-install.bat
-```
-
-**For Linux/macOS Users:**
-
-```bash
-chmod +x install.sh
+# Linux / macOS
 ./install.sh
 ```
 
-### Step 3: Configure MPV IPC Socket (`mpv.conf`)
+```powershell
+# Windows (PowerShell / cmd)
+install.bat
+```
 
-The Python client needs to communicate with MPV via an Inter-Process Communication (IPC) socket. You must enable the IPC server in your `mpv.conf` file.
+> **Note on CUDA:** The installation scripts attempt to install a PyTorch wheel targeting a common CUDA version for immediate GPU acceleration. If you encounter issues, you may need to manually install PyTorch compatible with your specific hardware and drivers *before* running the script.
 
-Add **one** of the following lines to your `mpv.conf` file, depending on your operating system:
+## ⚙️ MPV Configuration
 
-| Operating System | `mpv.conf` Setting |
-| :--- | :--- |
-| **Linux/macOS** | `input-ipc-server=/tmp/mpv-socket` |
-| **Windows** | `input-ipc-server=\\.\pipe\mpv-socket` |
+The Python service relies on MPV's IPC socket for communication.
 
-### Step 4: Bind a Key for Toggling (`input.conf`)
+### 1. Enable IPC Server
 
-Add a key binding to your `input.conf` file to easily start and stop the service using the Lua script:
+Add the following line to your `mpv.conf`:
 
 ```conf
-# Binds the 'l' key to toggle the AI subtitle service
+# Linux/macOS Example
+input-ipc-server=/tmp/mpv-socket
+# Windows Example
+input-ipc-server=\\.\pipe\mpv-socket
+```
+
+### 2. Set Input Binding
+
+Bind a key in your `input.conf` to toggle the service. This key triggers the Lua script, which manages starting the Python client if it isn't already running.
+
+```conf
+# Example: Press 'l' (letter L) to toggle the service
 l script-message toggle_ai_subtitles
 ```
 
-## 🚀 Usage and Service Lifecycle
+## 🎬 Usage
 
-### Initial Startup (First Run Only)
+1.  Start MPV with IPC configured.
+2.  Load a video file.
+3.  Press the configured toggle key (e.g., `l`).
 
-The very first time you run the service, the Docker image must be built. This process downloads the large AI model and can take **5 to 15 minutes** depending on your internet speed and CPU/GPU.
+The Lua script will attempt to start `main.py` from the virtual environment. The service will then:
 
-1.  **Start Docker Desktop/Daemon.**
-2.  **Start MPV** and open a video.
-3.  **Press the bound key (e.g., `l`).**
-    *   MPV will display: `AI Subtitles: Building Docker image...`
-    *   Wait for the build to complete. MPV will then display: `AI Service: Starting... (Loading model, please wait)`
-    *   The service is ready when the OSD confirms: `AI Subtitle Service: ON`.
+1.  Extract the audio from the video using FFmpeg.
+2.  Start background transcription.
+3.  As chunks are transcribed, the `.ai.ass` file is created/updated.
+4.  MPV is notified to automatically load or reload the subtitle file.
 
-### Subsequent Usage
+## 🛠️ Repository Layout
 
-After the initial build, the Docker image is cached, and the container is persistent.
+| File / Directory | Description |
+| :--- | :--- |
+| `main.lua` | The MPV-side script. Handles the toggle hotkey, launches the Python client if necessary, and forwards playback events (seeks, loads). |
+| `main.py` | The main Python service handler. Connects to MPV via IPC, manages the lifecycle of per-video transcription engines. |
+| `ai_engine.py` | The core, per-video processing engine. Manages FFmpeg audio extraction, schedules chunk transcription, groups words, and writes atomic ASS files. |
+| `transcription.py` | Defines the `TranscriptionInterface` and the default `ParakeetLocalClient` (using NeMo). |
+| `install.bat` / `install.sh` | Helpers for setting up the Python environment and dependencies. |
+| `requirements.txt` | Python dependencies. |
 
-1.  **Start Docker Desktop/Daemon.**
-2.  **Start MPV** and open a video.
-3.  **Press the bound key (e.g., `l`).**
-    *   The container starts quickly, but the AI model still needs to load onto the GPU/CPU. Wait for the `(Loading model, please wait)` message to clear.
-4.  **Real-Time Transcription:** As the video plays, the Python client queues chunks for transcription. The generated subtitles will appear in real-time and update the `.ai.ass` file next to your video.
+## 🧩 Configuration & Extensibility
 
-### Stopping the Service
+### Chunk Size
 
-Press the bound key again (e.g., `l`). The Lua script will send a shutdown command to the Python client and forcefully stop and remove the persistent Docker container, freeing up GPU resources.
+The balance between responsiveness and model efficiency is controlled by the chunk duration:
 
-## 🐛 Troubleshooting and Logging
+*   **`CONFIG['CHUNK_DURATION_SECONDS']`** in `main.py` (Default: 30s).
 
-The Python client generates a detailed log file that is essential for debugging connection issues or transcription failures:
+### Pluggable Transcription Backends
 
-*   **Log File Location:** `[script_directory]/subtitle_service.log`
-    *(Note: This file is overwritten every time the Python client starts.)*
+The service is designed to allow easy swapping of ASR providers:
 
-If the service fails to start:
+1.  Implement a new class that inherits from `TranscriptionInterface` in `transcription.py`.
+2.  Ensure your implementation returns a standard `words` structure: a list of objects containing `word`, `start` (timestamp in seconds), and `end` (timestamp in seconds).
+3.  Update the configuration in `main.py` to use your custom client class.
 
-1.  **Check Docker Status:** Ensure Docker is running and that the container `mpv_whisperx_instance` is not stuck in a failed state.
-2.  **Check Logs:** Review `subtitle_service.log` for `[FATAL]` or `[CRITICAL]` errors.
-    *   If you see errors connecting to `http://localhost:5000`, the Docker container failed to start or the model failed to load.
-    *   If you see errors connecting to the MPV socket, double-check your `mpv.conf` setting matches the path expected by your OS.
+## 🗃️ Logs and Artifacts
+
+*   **`<video_basename>.ai.ass`:** The generated subtitle file, saved next to the source video.
+*   **`subtitle_service.log`:** Created in the script directory, containing startup messages, model load diagnostics, and FFmpeg errors.
+*   **Lock File:** The service creates a lock file in the system temp directory (`tempfile.gettempdir()`) to prevent multiple instances of the service from running concurrently.
+
+## 🛑 Troubleshooting
+
+**1. Model Load Failures (ASR)**
+
+*   **Check the Log:** Review `subtitle_service.log` for Python tracebacks.
+*   **Dependencies:** Ensure `nemo_toolkit[asr]` is installed (required for the default client).
+*   **GPU Issues:** If using CUDA, verify that your installed PyTorch version is compatible with your GPU drivers and that the model is correctly moving to the device.
+
+**2. MPV IPC Connection Errors**
+
+*   Ensure the `input-ipc-server` path in your `mpv.conf` exactly matches the path the Python client is trying to connect to (usually `/tmp/mpv-socket` or `\\.\pipe\mpv-socket`).
+*   Verify that no other application is using that IPC path.
+
+**3. FFmpeg Errors**
+
+*   Confirm that `ffmpeg` is available on your system `PATH`.
+*   Ensure the service has read access to the video file (FFmpeg needs to read the video to extract the PCM audio).
+
+**4. Stale Lock File**
+
+If the service crashed unexpectedly, a stale lock file may prevent new instances from launching. If you confirm no service is running, manually delete the lock file from your OS temporary folder.
+
+## 🔒 Security & Privacy
+
+This project is built to run entirely locally by default. Audio processing and transcription are performed on the same machine. No data is ever transmitted beyond your machine.

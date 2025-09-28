@@ -1,5 +1,7 @@
-requests
 python-mpv-jsonipc
 numpy
 portalocker
 scipy
+nemo_toolkit[asr]==2.3.3
+cuda-python
+psutil
