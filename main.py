@@ -23,6 +23,7 @@ from transcription import ParakeetLocalClient
 # Logging to file and stdout
 script_dir = os.path.dirname(os.path.abspath(__file__))
 log_file_path = os.path.join(script_dir, 'subtitle_service.log')
+os.chdir(script_dir)
 
 logging.basicConfig(
     level=logging.INFO,
