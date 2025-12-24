@@ -1,54 +1,75 @@
 #!/bin/bash
+set -e
 
-# Minimal environment setup for Linux/macOS to create reproducible venv and deps
-VENV_DIR="venv"
-REQUIREMENTS_FILE="requirements.txt"
+echo "============================================"
+echo " AI Subtitle Service Installation"
+echo "============================================"
+echo ""
 
-echo "Starting AI Subtitle Service client installation for Linux/macOS..."
+# --- Prerequisite Checks ---
+echo "[*] Checking prerequisites..."
 
-check_dependency() {
-    # Fail early if required system tools are missing to avoid partial installs
-    if ! command -v "$1" &> /dev/null; then
-        echo "Error: $1 is not found in your PATH."
-        echo "Please install $1 and ensure it is accessible."
-        exit 1
-    fi
-}
-
-check_dependency python3
-check_dependency ffmpeg
-
-# Create a virtualenv once so repeated runs are safe and idempotent
-if [ ! -d "$VENV_DIR" ]; then
-    echo "Creating Python virtual environment in './$VENV_DIR'..."
-    python3 -m venv "$VENV_DIR"
-    if [ $? -ne 0 ]; then
-        echo "Error: Failed to create virtual environment."
-        exit 1
-    fi
-fi
-
-# Activate and install pinned dependencies for reproducible environments
-echo "Activating virtual environment and installing dependencies..."
-source "$VENV_DIR/bin/activate"
-
-echo "Upgrading pip..."
-pip install --upgrade pip
-
-echo "Installing Python packages from $REQUIREMENTS_FILE..."
-pip install -r "$REQUIREMENTS_FILE"
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to install required packages."
-    deactivate
+if ! command -v python3 &> /dev/null; then
+    echo "[X] Error: Python 3 not found"
+    echo "    Please install Python 3.9+"
     exit 1
 fi
 
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129
+if ! command -v ffmpeg &> /dev/null; then
+    echo "[X] Error: FFmpeg not found"
+    echo "    Please install FFmpeg"
+    exit 1
+fi
 
-# Deactivate the virtual environment after installation to leave a clean shell
-deactivate
+echo "[OK] Prerequisites found"
 
-echo "--------------------------------------------------"
-echo "[V] Installation complete!"
-echo "You can now use the AI Subtitle service in mpv."
-echo "--------------------------------------------------"
+# --- Create Virtual Environment ---
+VENV_DIR="venv"
+
+if [ ! -d "$VENV_DIR" ]; then
+    echo ""
+    echo "[*] Creating Python virtual environment..."
+    python3 -m venv "$VENV_DIR"
+fi
+
+# --- Activate and Install ---
+echo ""
+echo "[*] Activating virtual environment..."
+source "$VENV_DIR/bin/activate"
+
+echo "[*] Upgrading pip..."
+pip install --upgrade pip --quiet
+
+echo "[*] Installing package in development mode..."
+pip install -e . --quiet
+
+echo "[*] Installing ASR dependencies..."
+pip install -r requirements.txt --quiet || echo "[!] Warning: Some ASR dependencies failed"
+
+# --- GPU Support ---
+echo ""
+echo "[*] Installing PyTorch..."
+
+# Detect CUDA availability
+if command -v nvidia-smi &> /dev/null; then
+    echo "[*] NVIDIA GPU detected, installing CUDA support..."
+    pip install torch torchvision torchaudio --quiet || echo "[!] Warning: GPU support installation failed"
+else
+    echo "[*] No NVIDIA GPU detected, installing CPU version..."
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --quiet || echo "[!] Warning: PyTorch installation failed"
+fi
+
+echo ""
+echo "============================================"
+echo "[OK] Installation complete!"
+echo ""
+echo "Next steps:"
+echo "  1. Configure MPV IPC in mpv.conf:"
+echo "     input-ipc-server=/tmp/mpv-socket"
+echo ""
+echo "  2. Add keybinding in input.conf:"
+echo "     l script-message toggle_ai_subtitles"
+echo ""
+echo "  3. Copy this folder to MPV scripts directory:"
+echo "     ~/.config/mpv/scripts/"
+echo "============================================"

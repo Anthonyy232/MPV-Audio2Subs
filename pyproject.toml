@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audio2subs"
+version = "1.0.0"
+description = "Real-time AI subtitle generation for MPV"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Anthonyy232"}
+]
+keywords = ["mpv", "subtitles", "asr", "speech-recognition", "nemo", "parakeet"]
+
+dependencies = [
+    "python-mpv-jsonipc",
+    "numpy",
+    "portalocker",
+]
+
+[project.optional-dependencies]
+asr = [
+    "nemo_toolkit[asr]>=2.0.0",
+    "torch",
+]
+dev = [
+    "pytest",
+    "mypy",
+    "ruff",
+]
+
+[project.scripts]
+audio2subs = "audio2subs.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
