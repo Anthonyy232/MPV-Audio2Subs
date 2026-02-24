@@ -70,6 +70,9 @@ class AudioExtractor:
         Call `bytes_available` to check progress and `is_ready` for completion.
         """
         self._create_temp_file()
+        # Open the file handle for reading immediately so read_chunk() can
+        # enter its wait-for-data loop instead of returning None early.
+        self._open_for_reading()
         self._extraction_thread = threading.Thread(
             target=self._streaming_extraction_worker,
             daemon=True,
@@ -92,7 +95,6 @@ class AudioExtractor:
         """Background worker for streaming extraction."""
         try:
             self._run_ffmpeg()
-            self._open_for_reading()
         except Exception as e:
             with self._lock:
                 self._extraction_error = e
