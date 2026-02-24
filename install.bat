@@ -9,11 +9,14 @@ echo.
 REM --- Prerequisite Checks ---
 echo [*] Checking prerequisites...
 
-where python >nul 2>nul
+where uv >nul 2>nul
 if %errorlevel% neq 0 (
-    echo [X] Error: Python not found in PATH
-    echo     Please install Python 3.9+ and add it to PATH
-    goto :error
+    echo [*] uv not found, attempting to install...
+    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+    if %errorlevel% neq 0 (
+        echo [X] Error: Failed to install uv
+        goto :error
+    )
 )
 
 where ffmpeg >nul 2>nul
@@ -30,42 +33,36 @@ set VENV_DIR=venv
 
 if not exist "%VENV_DIR%" (
     echo.
-    echo [*] Creating Python virtual environment...
-    python -m venv "%VENV_DIR%"
+    echo [*] Creating virtual environment with uv...
+    uv venv "%VENV_DIR%"
     if %errorlevel% neq 0 (
         echo [X] Failed to create virtual environment
         goto :error
     )
 )
 
-REM --- Activate and Install ---
+REM --- Install Dependencies ---
 echo.
-echo [*] Activating virtual environment...
-call "%VENV_DIR%\Scripts\activate.bat"
+echo [*] Installing dependencies with uv...
 
-echo [*] Upgrading pip...
-python -m pip install --upgrade pip --quiet
-
-echo [*] Installing package in development mode...
-python -m pip install -e . --quiet
+REM Install specialized PyTorch for RTX 50 series (Blackwell)
+uv pip install --python "%VENV_DIR%\Scripts\python.exe" torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 --quiet
 if %errorlevel% neq 0 (
-    echo [X] Failed to install package
-    goto :error
+    echo [!] Warning: GPU support installation failed
+    echo     Falling back to CPU mode
+    uv pip install --python "%VENV_DIR%\Scripts\python.exe" torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu --quiet
 )
 
-echo [*] Installing ASR dependencies...
-python -m pip install -r requirements.txt --quiet
+REM Install remaining dependencies and local package
+uv pip install --python "%VENV_DIR%\Scripts\python.exe" -r requirements.txt --quiet
 if %errorlevel% neq 0 (
     echo [!] Warning: Some ASR dependencies failed
 )
 
-REM --- GPU Support ---
-echo.
-echo [*] Installing PyTorch with CUDA support...
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --quiet
+uv pip install --python "%VENV_DIR%\Scripts\python.exe" -e . --quiet
 if %errorlevel% neq 0 (
-    echo [!] Warning: GPU support installation failed
-    echo     Falling back to CPU mode
+    echo [X] Failed to install package in development mode
+    goto :error
 )
 
 echo.

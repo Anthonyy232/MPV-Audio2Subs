@@ -5,6 +5,3 @@ portalocker
 
 # ASR dependencies (NeMo)
 nemo_toolkit[asr]>=2.0.0
-
-# GPU support - install via PyTorch index
-# torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
