@@ -6,3 +6,4 @@ subtitle_service.log
 *.log
 __pycache__
 .venv
+*.egg-info/
