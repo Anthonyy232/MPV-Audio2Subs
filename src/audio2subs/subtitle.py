@@ -95,7 +95,7 @@ class SubtitleWriter:
         return self.add_segments(segments)
     
     def add_segments(self, segments: list[SubtitleSegment]) -> int:
-        """Add new segments to the subtitle file with O(M log N) insertion.
+        """Add new segments to the subtitle file efficiently.
         
         Args:
             segments: Segments to add
@@ -111,21 +111,15 @@ class SubtitleWriter:
             # We can use the start times of existing segments to find boundaries
             starts = [s.start for s in self._segments]
             new_segments: list[SubtitleSegment] = []
+            tolerance = 0.1
+            max_dur = self.config.max_duration_s
             
             # For each new segment evaluate overlaps efficiently
             for seg in segments:
-                # Find range of potentially overlapping segments
-                # Any overlapping segment must start before seg.end + tolerance
-                # and end after seg.start - tolerance
-                tolerance = 0.1
-                
-                # left_idx: first segment that starts after seg.start - (max_dur + tolerance)
-                # Since we don't know the max duration of previous segments in a single array
-                # without an interval tree, we use a generous bound based on max_duration_s
-                search_start = seg.start - self.config.max_duration_s - tolerance
+                # Range of potentially overlapping segments
+                search_start = seg.start - max_dur - tolerance
                 left_idx = bisect.bisect_left(starts, search_start)
                 
-                # right_idx: first segment that starts after seg.end + tolerance
                 search_end = seg.end + tolerance
                 right_idx = bisect.bisect_right(starts, search_end)
                 
@@ -147,8 +141,9 @@ class SubtitleWriter:
                     added += 1
             
             if added > 0:
-                for seg in new_segments:
-                    bisect.insort(self._segments, seg)
+                # Timsort is heavily optimized for partially sorted arrays -> near O(N)
+                self._segments.extend(new_segments)
+                self._segments.sort()
         
         return added
     
