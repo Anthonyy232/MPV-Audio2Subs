@@ -12,7 +12,7 @@ license = {text = "MIT"}
 authors = [
     {name = "Anthonyy232"}
 ]
-keywords = ["mpv", "subtitles", "asr", "speech-recognition", "nemo", "parakeet"]
+keywords = ["mpv", "subtitles", "asr", "speech-recognition", "qwen", "qwen3-asr"]
 
 dependencies = [
     "python-mpv-jsonipc",
@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 asr = [
-    "nemo_toolkit[asr]>=2.0.0",
+    "qwen-asr",
     "torch",
 ]
 dev = [

@@ -97,6 +97,7 @@ function Service:start()
     end
     
     local socket_path = mp.get_property("input-ipc-server")
+    local socket_path = mp.get_property("input-ipc-server")
     local python = get_python_executable()
     
     if not socket_path then
@@ -105,24 +106,17 @@ function Service:start()
         return
     end
     
-    if not python then
-        self:update_osd("Error: Python venv not found", 5000)
-        return
-    end
-    
     self:set_state(ServiceState.STARTING, "Starting Python service...")
     self:update_osd("AI Subtitles: Starting...", 15000)
     
-    -- Launch Python process
-    local args = {
-        python,
-        "-m", "audio2subs",
-        "--socket", socket_path,
-    }
+    -- Try global 'audio2subs' first, then local venv package, then local venv main.py
+    local args = {"audio2subs", "--socket", socket_path}
+    local fallback_args = python and {python, "-m", "audio2subs", "--socket", socket_path} or nil
+    local fallback2_args = python and {python, config.python_script, "--socket", socket_path} or nil
     
-    log("Launching: " .. table.concat(args, " "))
+    log("Trying global package launch: " .. table.concat(args, " "))
     
-    -- Launch Python process asynchronously
+    -- Launch process asynchronously
     mp.command_native_async({
         name = "subprocess",
         args = args,
@@ -130,13 +124,17 @@ function Service:start()
         capture_stdout = true,
         capture_stderr = true,
     }, function(success, result, error)
-        if not success then
-            log("Launch failed: " .. (error or "Unknown error"))
+        if not success or (result and result.status ~= 0) then
+            log("Global launch failed/not found. Trying venv fallback...")
             
-            -- Fallback to old-style invocation if package launch fails
-            log("Trying fallback main.py...")
-            local fallback_args = { python, config.python_script, "--socket", socket_path }
+            if not fallback_args then
+                self:set_state(ServiceState.ERROR, "No global 'audio2subs' found, and no local python venv found.")
+                self:update_osd("Error: 'audio2subs' or venv not found", 5000)
+                self.python_running = false
+                return
+            end
             
+            log("Launching venv package: " .. table.concat(fallback_args, " "))
             mp.command_native_async({
                 name = "subprocess",
                 args = fallback_args,
@@ -144,16 +142,32 @@ function Service:start()
                 capture_stdout = true,
                 capture_stderr = true,
             }, function(f_success, f_result, f_error)
-                if not f_success then
-                    self:set_state(ServiceState.ERROR, "Failed to launch Python process (fallback also failed)")
-                    self:update_osd("AI Subtitles Error: Launch failed", 5000)
-                    self.python_running = false
+                if not f_success or (f_result and f_result.status ~= 0) then
+                    log("Venv package launch failed. Trying legacy main.py...")
+                    
+                    log("Launching venv main.py: " .. table.concat(fallback2_args, " "))
+                    mp.command_native_async({
+                        name = "subprocess",
+                        args = fallback2_args,
+                        playback_only = false,
+                        capture_stdout = true,
+                        capture_stderr = true,
+                    }, function(f2_success, f2_result, f2_error)
+                        if not f2_success or (f2_result and f2_result.status ~= 0) then
+                            self:set_state(ServiceState.ERROR, "All launch methods failed!")
+                            self:update_osd("AI Subtitles Error: Launch completely failed", 5000)
+                            self.python_running = false
+                        else
+                            log("Python process started successfully via legacy main.py (PID: " .. (f2_result.pid or "unknown") .. ")")
+                        end
+                    end)
+                else
+                    log("Python process started successfully via venv package (PID: " .. (f_result.pid or "unknown") .. ")")
                 end
             end)
-            return
+        else
+            log("Python process started successfully via global executable (PID: " .. (result.pid or "unknown") .. ")")
         end
-        
-        log("Python process started successfully (PID: " .. (result.pid or "unknown") .. ")")
     end)
     
     self.python_running = true

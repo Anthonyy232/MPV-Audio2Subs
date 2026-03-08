@@ -1,0 +1,181 @@
+"""Qwen3 ASR transcription backend."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from audio2subs.config import TranscriptionConfig
+from audio2subs.exceptions import TranscriptionError
+from audio2subs.transcription.base import (
+    BaseTranscriber,
+    TranscriptionResult,
+    WordTimestamp,
+    SAMPLE_RATE,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class QwenTranscriber(BaseTranscriber):
+    """Qwen3 ASR transcriber for local, high-quality transcription."""
+
+    def __init__(self, config: TranscriptionConfig):
+        """Initialize the Qwen transcriber.
+
+        Args:
+            config: Transcription configuration (model name, device)
+        """
+        super().__init__()
+        self.config = config
+        self._model: Any = None
+
+    def load(self) -> None:
+        """Load the Qwen model onto the configured device.
+
+        Raises:
+            TranscriptionError: If loading fails
+        """
+        if self._is_loaded:
+            return
+
+        logger.info(f"Loading Qwen model: {self.config.model_name}")
+
+        try:
+            import torch
+            from qwen_asr import Qwen3ASRModel
+
+            device = self.config.get_device()
+            
+            # Determine appropriate dtype based on device and capability
+            dtype = torch.float32
+            if device == "cuda":
+                if torch.cuda.is_available():
+                    caps = torch.cuda.get_device_capability()
+                    if caps[0] >= 8:  # Ampere or newer supports bfloat16 natively
+                        dtype = torch.bfloat16
+                    else:
+                        dtype = torch.float16
+
+            logger.debug(f"Loading on {device} with dtype {dtype}")
+
+            self._model = Qwen3ASRModel.from_pretrained(
+                self.config.model_name,
+                dtype=dtype,
+                device_map=device,
+                max_inference_batch_size=32,
+                max_new_tokens=4096,
+                forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B",
+                forced_aligner_kwargs=dict(
+                    dtype=dtype,
+                    device_map=device,
+                ),
+            )
+
+            self._is_loaded = True
+            self._loaded_event.set()
+            logger.info("Qwen model loaded successfully")
+
+        except Exception as e:
+            self._is_loaded = False
+            self._loaded_event.set()
+            self._model = None
+            raise TranscriptionError(f"Failed to load Qwen model: {e}") from e
+
+    def transcribe(self, audio_buffer: bytes) -> TranscriptionResult:
+        """Transcribe raw PCM audio using Qwen3 ASR.
+
+        Args:
+            audio_buffer: Raw PCM audio bytes (16kHz, mono, 16-bit)
+
+        Returns:
+            TranscriptionResult with word-level timestamps
+
+        Raises:
+            TranscriptionError: If transcription fails
+        """
+        if not self._is_loaded or self._model is None:
+            raise TranscriptionError("Qwen model is not loaded")
+
+        if not audio_buffer:
+            return TranscriptionResult()
+
+        try:
+            import numpy as np
+            
+            # Convert bytes to numpy array
+            audio_array = np.frombuffer(audio_buffer, dtype=np.int16)
+            
+            # Convert to float32 normalized between -1.0 and 1.0 (typical model expectation)
+            audio_float = audio_array.astype(np.float32) / 32768.0
+
+            # Run transcription with English language
+            results = self._model.transcribe(
+                audio=(audio_float, SAMPLE_RATE),
+                language="English",
+                return_time_stamps=True,
+            )
+
+            if not results or not results[0]:
+                logger.debug("Qwen returned no results for chunk")
+                return TranscriptionResult()
+                
+            result = results[0]
+            
+            if not result.text:
+                return TranscriptionResult()
+
+            # Qwen returns timestamps as characters or words
+            words = []
+            if result.time_stamps:
+                # time_stamps is a list of ForcedAlignItem objects
+                for ts in result.time_stamps:
+                    words.append(
+                        WordTimestamp(
+                            word=ts.text,
+                            start=float(ts.start_time),
+                            end=float(ts.end_time),
+                        )
+                    )
+
+            # If forced aligner failed but we have text, we return empty words
+            # The engine requires words for subtitle generation.
+            if not words and result.text:
+                logger.warning("No timestamps returned from Qwen forced aligner.")
+
+            return TranscriptionResult(
+                words=words,
+                full_text=result.text.strip(),
+            )
+
+        except Exception as e:
+            logger.error(f"Qwen transcription failed: {e}", exc_info=True)
+            raise TranscriptionError(f"Transcription failed: {e}") from e
+
+    def close(self) -> None:
+        """Release the model from memory."""
+        super().close()
+        if self._model is not None:
+            logger.info("Releasing Qwen model from memory")
+            
+            try:
+                # Clean up memory
+                del self._model
+                self._model = None
+                
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ImportError:
+                    pass
+                    
+            except ImportError:
+                self._model = None
+
+    def __enter__(self) -> "QwenTranscriber":
+        self.load()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()

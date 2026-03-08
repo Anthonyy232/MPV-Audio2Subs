@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
@@ -55,11 +56,16 @@ class BaseTranscriber(ABC):
     
     def __init__(self):
         self._is_loaded = False
+        self._loaded_event = threading.Event()
     
     @property
     def is_loaded(self) -> bool:
         """Whether the model is loaded and ready."""
         return self._is_loaded
+        
+    def wait_for_load(self, timeout: float | None = None) -> bool:
+        """Wait for the transcriber to be loaded. Returns True if loaded, False if timeout."""
+        return self._loaded_event.wait(timeout)
     
     @abstractmethod
     def transcribe(self, audio_buffer: bytes) -> TranscriptionResult:

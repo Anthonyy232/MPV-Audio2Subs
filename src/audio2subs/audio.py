@@ -40,8 +40,10 @@ class AudioExtractor:
         self._extraction_complete = threading.Event()
         self._extraction_thread: threading.Thread | None = None
         self._extraction_error: Exception | None = None
-        self._bytes_written = 0
+        self._bytes_written: int = 0
+        self._last_chunk_cache: tuple[float, float, bytes] | None = None  # (start_time, end_time, data)
         self._lock = threading.Lock()
+        self._data_cv = threading.Condition(self._lock)
     
     @property
     def is_ready(self) -> bool:
@@ -61,7 +63,12 @@ class AudioExtractor:
             AudioExtractionError: If FFmpeg fails
         """
         self._create_temp_file()
-        self._run_ffmpeg()
+        try:
+            self._run_ffmpeg()
+        finally:
+            self._extraction_complete.set()
+            with self._data_cv:
+                self._data_cv.notify_all()
         self._open_for_reading()
     
     def extract_streaming(self) -> None:
@@ -101,6 +108,8 @@ class AudioExtractor:
             logger.error(f"Streaming extraction failed: {e}")
         finally:
             self._extraction_complete.set()
+            with self._data_cv:
+                self._data_cv.notify_all()
     
     def _create_temp_file(self) -> None:
         """Create a temporary file for audio data."""
@@ -114,7 +123,7 @@ class AudioExtractor:
             raise AudioExtractionError("Temp file not created")
         
         # Build FFmpeg command
-        cmd = ['ffmpeg', '-y', '-i', self.video_path]
+        cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-i', self.video_path]
         
         # Select specific audio track if specified
         if self.audio_track_id is not None:
@@ -157,8 +166,10 @@ class AudioExtractor:
                     if self._temp_file_path and os.path.exists(self._temp_file_path):
                         try:
                             size = os.path.getsize(self._temp_file_path)
-                            with self._lock:
-                                self._bytes_written = size
+                            with self._data_cv:
+                                if size > self._bytes_written:
+                                    self._bytes_written = size
+                                    self._data_cv.notify_all()
                         except OSError:
                             pass
                     
@@ -223,32 +234,42 @@ class AudioExtractor:
             return None
         
         # In streaming mode, wait for data to become available
-        while True:
-            with self._lock:
+        with self._data_cv:
+            while True:
                 available = self._bytes_written
                 complete = self._extraction_complete.is_set()
                 err = self._extraction_error
-            
-            if err:
-                raise err
-            
-            if start_offset + num_bytes <= available:
-                break # Data is ready
                 
-            if complete:
-                # Extraction finished but we don't have enough bytes?
-                # This can happen at the very end of a file due to rounding
-                if start_offset < available:
-                    num_bytes = available - start_offset
-                    break
-                return None
+                if err:
+                    raise err
                 
-            # Wait for more data
-            time.sleep(0.1)
+                if start_offset + num_bytes <= available:
+                    break # Data is ready
+                    
+                if complete:
+                    # Extraction finished but we don't have enough bytes?
+                    # This can happen at the very end of a file due to rounding
+                    if start_offset < available:
+                        num_bytes = available - start_offset
+                        break
+                    return None
+                    
+                # Wait for more data gracefully without spinning
+                self._data_cv.wait(timeout=1.0)
         
         try:
+            # Check memory cache to prevent redundant disk seeks for adjoining window overlaps
+            if self._last_chunk_cache:
+                c_start, c_end, c_data = self._last_chunk_cache
+                if c_start == start_time and c_end == end_time:
+                    return c_data
+
             self._file_handle.seek(start_offset)
-            return self._file_handle.read(num_bytes)
+            data = self._file_handle.read(num_bytes)
+            
+            # Cache output
+            self._last_chunk_cache = (start_time, end_time, data)
+            return data
         except (IOError, ValueError) as e:
             logger.error(f"Failed to read audio chunk: {e}")
             return None

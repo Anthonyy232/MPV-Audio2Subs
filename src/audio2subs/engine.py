@@ -148,10 +148,14 @@ class TranscriptionEngine:
         logger.info(f"{self._log_prefix} Stopping engine")
         self._stop_event.set()
         
-        # Clear the queue to unblock worker
+        # Clear the queue contents to unblock worker gracefully
         with self._queue_lock:
-            self._task_queue = PriorityQueue()
+            with self._task_queue.mutex:
+                self._task_queue.queue.clear()
             self._queued_chunks.clear()
+            
+            # Insert poison pill to immediately wake up waiting worker block
+            self._task_queue.put((-1, (0.0, 0.0, -1)))
         
         # Signal writer to do final flush
         self._rewrite_needed.set()
@@ -245,6 +249,19 @@ class TranscriptionEngine:
         start_time, end_time, chunk_idx = task
         
         try:
+            # Wait for transcriber to be fully loaded
+            if not self.transcriber.is_loaded:
+                logger.debug(f"{self._log_prefix} Waiting for transcription model to finish loading...")
+                while not self.transcriber.is_loaded and not self._stop_event.is_set():
+                    if hasattr(self.transcriber, 'wait_for_load'):
+                        if self.transcriber.wait_for_load(1.0):
+                            break
+                    else:
+                        time.sleep(0.5)
+                        
+                if self._stop_event.is_set():
+                    return
+            
             # Read audio chunk
             audio_data = self._audio.read_chunk(start_time, end_time)
             if not audio_data:
@@ -326,16 +343,15 @@ class TranscriptionEngine:
     
     def _clear_queue(self) -> None:
         """Clear active chunks from queue, keep idle chunks."""
-        old_queue = self._task_queue
-        self._task_queue = PriorityQueue()
+        # Find idle tasks before clearing
+        idle_tasks = [item for item in self._task_queue.queue if item[0] >= self.IDLE_PRIORITY_OFFSET]
+        
+        # Clear the queue contents
+        with self._task_queue.mutex:
+            self._task_queue.queue.clear()
         self._queued_chunks.clear()
         
-        # Re-add idle priority tasks
-        while not old_queue.empty():
-            try:
-                priority, task = old_queue.get_nowait()
-                if priority >= self.IDLE_PRIORITY_OFFSET:
-                    self._task_queue.put((priority, task))
-                    self._queued_chunks.add(task[0])
-            except Empty:
-                break
+        # Re-add idle priority tasks efficiently
+        for priority, task in idle_tasks:
+            self._task_queue.put((priority, task))
+            self._queued_chunks.add(task[0])

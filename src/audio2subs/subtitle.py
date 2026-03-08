@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import threading
@@ -29,6 +30,12 @@ class SubtitleSegment:
     def overlaps(self, other: "SubtitleSegment", tolerance: float = 0.1) -> bool:
         """Check if this segment overlaps with another within tolerance."""
         return not (self.end + tolerance < other.start or other.end + tolerance < self.start)
+        
+    def __eq__(self, other: object) -> bool:
+        """Enable equality check."""
+        if not isinstance(other, SubtitleSegment):
+            return NotImplemented
+        return self.start == other.start and self.end == other.end and self.text == other.text
 
 
 class SubtitleWriter:
@@ -88,7 +95,7 @@ class SubtitleWriter:
         return self.add_segments(segments)
     
     def add_segments(self, segments: list[SubtitleSegment]) -> int:
-        """Add new segments to the subtitle file.
+        """Add new segments to the subtitle file with O(M log N) insertion.
         
         Args:
             segments: Segments to add
@@ -99,31 +106,51 @@ class SubtitleWriter:
         if not segments:
             return 0
         
-        added = 0
+        added: int = 0
         with self._lock:
+            # We can use the start times of existing segments to find boundaries
+            starts = [s.start for s in self._segments]
+            new_segments: list[SubtitleSegment] = []
+            
+            # For each new segment evaluate overlaps efficiently
             for seg in segments:
-                # Check for duplicate/overlapping segments with same text
+                # Find range of potentially overlapping segments
+                # Any overlapping segment must start before seg.end + tolerance
+                # and end after seg.start - tolerance
+                tolerance = 0.1
+                
+                # left_idx: first segment that starts after seg.start - (max_dur + tolerance)
+                # Since we don't know the max duration of previous segments in a single array
+                # without an interval tree, we use a generous bound based on max_duration_s
+                search_start = seg.start - self.config.max_duration_s - tolerance
+                left_idx = bisect.bisect_left(starts, search_start)
+                
+                # right_idx: first segment that starts after seg.end + tolerance
+                search_end = seg.end + tolerance
+                right_idx = bisect.bisect_right(starts, search_end)
+                
+                # Check for duplicates only within this slice
                 is_duplicate = any(
-                    existing.overlaps(seg) and existing.text == seg.text
-                    for existing in self._segments
+                    existing.overlaps(seg, tolerance) and existing.text == seg.text
+                    for existing in self._segments[left_idx:right_idx]
                 )
+                
+                # Check against elements added in the current batch
                 if not is_duplicate:
-                    self._insert_sorted(seg)
+                    is_duplicate = any(
+                        existing.overlaps(seg, tolerance) and existing.text == seg.text
+                        for existing in new_segments
+                    )
+                
+                if not is_duplicate:
+                    new_segments.append(seg)
                     added += 1
+            
+            if added > 0:
+                for seg in new_segments:
+                    bisect.insort(self._segments, seg)
         
         return added
-    
-    def _insert_sorted(self, segment: SubtitleSegment) -> None:
-        """Insert a segment maintaining sorted order by start time."""
-        # Binary search for insertion point
-        lo, hi = 0, len(self._segments)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if self._segments[mid].start < segment.start:
-                lo = mid + 1
-            else:
-                hi = mid
-        self._segments.insert(lo, segment)
     
     def _words_to_segments(
         self,

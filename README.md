@@ -1,6 +1,6 @@
 # MPV-Audio2Subs: Real-Time AI Local Subtitles for MPV
 
-Generate high-quality, time-aligned subtitles for any video on the fly using local ASR with NVIDIA Parakeet.
+Generate high-quality, time-aligned subtitles for any video on the fly using local ASR with Qwen3-ASR.
 
 ## ✨ Features
 
@@ -21,12 +21,23 @@ Generate high-quality, time-aligned subtitles for any video on the fly using loc
 
 ### Installation
 
+There are two ways to install MPV-Audio2Subs: globally (recommended for a clean MPV folder) or locally (by cloning the repo directly into MPV).
+
+#### Global Installation (Recommended)
+This installs the Python AI engine globally so you only need `main.lua` in your MPV plugins folder.
+
+1. **Install the AI engine:**
 ```bash
-# Clone and install
-cd MPV-Audio2Subs
-./install.sh    # Linux/macOS
-install.bat     # Windows
+# Using uv (Recommended - much faster)
+uv tool install git+https://github.com/Anthonyy232/MPV-Audio2Subs.git
+
+# OR using pipx
+pipx install git+https://github.com/Anthonyy232/MPV-Audio2Subs.git
 ```
+
+2. **Install the MPV script:**
+Download `main.lua` and place it in your MPV scripts folder (e.g., as `audio2subs.lua`).
+
 
 ### MPV Configuration
 
@@ -40,9 +51,9 @@ input-ipc-server=/tmp/mpv-socket
 l script-message toggle_ai_subtitles
 ```
 
-3. Copy the folder to MPV scripts:
-   - **Linux/macOS**: `~/.config/mpv/scripts/audio2subs/`
-   - **Windows**: `%APPDATA%\mpv\scripts\audio2subs\`
+3. Ensure the script is in your MPV scripts folder:
+   - **Windows**: `%APPDATA%\mpv\scripts\audio2subs.lua` (if global) or `%APPDATA%\mpv\scripts\audio2subs\` (if local)
+   - **Linux/macOS**: `~/.config/mpv/scripts/audio2subs.lua` (if global) or `~/.config/mpv/scripts/audio2subs/` (if local)
 
 ### Usage
 
@@ -66,7 +77,7 @@ MPV-Audio2Subs/
 │   ├── config.py         # Configuration dataclasses
 │   └── transcription/    # ASR backends
 │       ├── base.py       # Interface
-│       └── parakeet.py   # NeMo Parakeet
+│       └── qwen.py       # Qwen3-ASR backend
 ├── pyproject.toml        # Modern packaging
 └── requirements.txt
 ```
@@ -82,7 +93,7 @@ Environment variables:
 
 **Model Load Failures**
 - Check `subtitle_service.log` for details
-- Ensure NeMo is installed: `pip install nemo_toolkit[asr]`
+- Ensure dependencies are installed correctly (`pip install qwen-asr`)
 
 **No Subtitles Appearing**
 - Verify MPV IPC is configured correctly

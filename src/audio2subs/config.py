@@ -11,7 +11,7 @@ from typing import Literal
 class TranscriptionConfig:
     """Configuration for the ASR transcription backend."""
     
-    model_name: str = "nvidia/parakeet-tdt-0.6b-v2"
+    model_name: str = "Qwen/Qwen3-ASR-1.7B"
     device: Literal["cuda", "cpu", "auto"] = "auto"
     
     def get_device(self) -> str:
@@ -53,7 +53,7 @@ class ServiceConfig:
     """Main service configuration."""
     
     # Chunking
-    chunk_duration_seconds: int = 60
+    chunk_duration_seconds: int = 30
     
     # MPV socket path (works on both Linux/macOS and Windows)
     socket_path: str = "/tmp/mpv-socket"

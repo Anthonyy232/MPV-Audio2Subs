@@ -5,11 +5,11 @@ from audio2subs.transcription.base import (
     WordTimestamp,
     BaseTranscriber,
 )
-from audio2subs.transcription.parakeet import ParakeetTranscriber
+from audio2subs.transcription.qwen import QwenTranscriber
 
 __all__ = [
     "TranscriptionResult",
     "WordTimestamp",
     "BaseTranscriber",
-    "ParakeetTranscriber",
+    "QwenTranscriber",
 ]

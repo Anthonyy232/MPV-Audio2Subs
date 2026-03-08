@@ -13,7 +13,7 @@ from audio2subs.service import SubtitleService
 
 def setup_logging(config: ServiceConfig, script_dir: str) -> None:
     """Configure logging."""
-    handlers = [logging.StreamHandler(sys.stdout)]
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     
     if config.log_to_file:
         log_path = os.path.join(script_dir, 'subtitle_service.log')
@@ -72,11 +72,17 @@ def main() -> int:
     if args.cpu:
         config.transcription.device = "cpu"
     
+    from pathlib import Path
+
     # Setup logging
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Go up two levels from audio2subs package to get the script directory
-    script_dir = os.path.dirname(os.path.dirname(script_dir))
-    setup_logging(config, script_dir)
+    # Use standard app data directory to avoid permission issues
+    if sys.platform == "win32":
+        log_dir = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "MPV-Audio2Subs"
+    else:
+        log_dir = Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))) / "mpv-audio2subs"
+    
+    log_dir.mkdir(parents=True, exist_ok=True)
+    setup_logging(config, str(log_dir))
     
     # Run service
     try:

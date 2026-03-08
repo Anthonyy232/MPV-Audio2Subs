@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from audio2subs.config import ServiceConfig
 from audio2subs.engine import TranscriptionEngine
 from audio2subs.mpv_client import MPVClient
-from audio2subs.transcription import ParakeetTranscriber
+from audio2subs.transcription import QwenTranscriber
 
 if TYPE_CHECKING:
     from audio2subs.transcription.base import BaseTranscriber
@@ -50,6 +50,10 @@ class SubtitleService:
         logger.info("Starting subtitle service")
         self._running = True
         
+        # Initialize transcriber instance immediately so engines can be created
+        if not self._transcriber:
+            self._transcriber = QwenTranscriber(self.config.transcription)
+            
         # Connect to MPV
         self._mpv = MPVClient(self.config.socket_path)
         
@@ -57,25 +61,28 @@ class SubtitleService:
         self._mpv.show_osd("AI Subtitle Service: Loading model...", 15000)
         self._mpv.send_message("ai-subs/starting")
         
-        # Load transcription model (can be slow)
-        try:
-            self._load_model()
-        except Exception:
-            self._running = False
-            return
-        
-        # Set up MPV event handlers
+        # Set up MPV event handlers IMMEDIATELY (no stalling)
         self._setup_observers()
-        
-        # Send "ready" status
-        self._mpv.show_osd("AI Subtitle Service: Ready", 3000)
-        self._mpv.send_message("ai-subs/ready")
         
         # Check if a video is already playing
         if self._mpv.path:
             self._on_path_change(None, self._mpv.path)
+            
+        # Start model loading in the background
+        threading.Thread(target=self._background_load, daemon=True, name="ModelLoader").start()
         
         logger.info("Subtitle service started")
+        
+    def _background_load(self) -> None:
+        """Background worker for loading the model."""
+        try:
+            self._load_model()
+            if self._running and self._mpv:
+                self._mpv.show_osd("AI Subtitle Service: Ready", 3000)
+                self._mpv.send_message("ai-subs/ready")
+        except Exception as e:
+            logger.error(f"Background loading failed: {e}")
+            self._running = False
     
     def run(self) -> None:
         """Run the service until shutdown."""
@@ -125,7 +132,8 @@ class SubtitleService:
         self._model_loading = True
         
         try:
-            self._transcriber = ParakeetTranscriber(self.config.transcription)
+            if not self._transcriber:
+                self._transcriber = QwenTranscriber(self.config.transcription)
             self._transcriber.load()
             self._model_loaded.set()
             logger.info("Model loaded successfully")

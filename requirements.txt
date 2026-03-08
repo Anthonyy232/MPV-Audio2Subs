@@ -3,5 +3,5 @@ python-mpv-jsonipc
 numpy
 portalocker
 
-# ASR dependencies (NeMo)
-nemo_toolkit[asr]>=2.0.0
+# ASR dependencies (Qwen3)
+qwen-asr
