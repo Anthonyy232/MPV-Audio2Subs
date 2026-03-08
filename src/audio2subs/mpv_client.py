@@ -233,12 +233,14 @@ class MPVClient:
             logger.info(f"Adding new AI subtitle with flag '{flag}'")
             self._mpv.sub_add(path, flag)
             
-            # Wait briefly for MPV to process, then find the track ID
-            time.sleep(0.1)
-            new_track = self._find_ai_track(path)
-            if new_track:
-                self._ai_track_id = new_track.get('id')
-                logger.info(f"AI track added with ID: {self._ai_track_id}")
+            # Use retry loop since track list propagation can be asynchronous
+            for _ in range(5):
+                time.sleep(0.1)
+                new_track = self._find_ai_track(path)
+                if new_track:
+                    self._ai_track_id = new_track.get('id')
+                    logger.info(f"AI track added with ID: {self._ai_track_id}")
+                    break
             
             return True
             

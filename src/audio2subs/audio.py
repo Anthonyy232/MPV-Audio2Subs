@@ -105,7 +105,7 @@ class AudioExtractor:
         except Exception as e:
             with self._lock:
                 self._extraction_error = e
-            logger.error(f"Streaming extraction failed: {e}")
+            logger.error(f"Streaming extraction failed for {os.path.basename(self.video_path)}: {e}")
         finally:
             self._extraction_complete.set()
             with self._data_cv:
@@ -141,10 +141,13 @@ class AudioExtractor:
         # Windows: hide console window
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         
-        # Calculate reasonable timeout
-        timeout = max(self.duration * 1.5, 60) if self.duration > 0 else 600
+        if self.duration > 0:
+            timeout = max(self.duration * 1.5, 60)
+        else:
+            timeout = 600
         
-        logger.info(f"Extracting audio to {os.path.basename(self._temp_file_path)}...")
+        filename = os.path.basename(self.video_path)
+        logger.info(f"Extracting audio from '{filename}' to '{os.path.basename(self._temp_file_path)}'...")
         
         try:
             process = subprocess.Popen(
@@ -157,10 +160,11 @@ class AudioExtractor:
             try:
                 # Monitor progress
                 start_time = time.time()
+                last_log_size = 0
                 while process.poll() is None:
                     if time.time() - start_time > timeout:
                         process.kill()
-                        raise AudioExtractionError(f"FFmpeg timed out after {timeout}s")
+                        raise AudioExtractionError(f"FFmpeg timed out after {timeout}s for {filename}")
                     
                     # Update bytes written so far
                     if self._temp_file_path and os.path.exists(self._temp_file_path):
@@ -170,13 +174,19 @@ class AudioExtractor:
                                 if size > self._bytes_written:
                                     self._bytes_written = size
                                     self._data_cv.notify_all()
+                            
+                            # Log every 10MB of progress
+                            if size - last_log_size > 10 * 1024 * 1024:
+                                logger.debug(f"Audio extraction progress: {size / (1024*1024):.1f} MB")
+                                last_log_size = size
                         except OSError:
                             pass
                     
                     time.sleep(0.5)
                 
                 if process.returncode != 0:
-                    stderr = process.stderr.read().decode(errors='ignore') if process.stderr else ""
+                    stderr = process.stderr.read().decode(errors='ignore') if process.stderr else "No stderr output"
+                    logger.error(f"FFmpeg failed with code {process.returncode}. Stderr: {stderr}")
                     raise AudioExtractionError(
                         f"FFmpeg exited with code {process.returncode}",
                         stderr=stderr

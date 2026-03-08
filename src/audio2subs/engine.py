@@ -97,7 +97,10 @@ class TranscriptionEngine:
         self._worker_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
         
-        self._log_prefix = f"[{self.video_filename[:15]}...]"
+        self._log_prefix = f"[Engine:{self.video_filename[:20]}]"
+    
+    def __repr__(self) -> str:
+        return f"TranscriptionEngine(video={self.video_filename}, progress={self.completed_count}/{self.total_chunks})"
     
     @property
     def is_finished(self) -> bool:
@@ -208,12 +211,20 @@ class TranscriptionEngine:
                 priority, task = self._task_queue.get(timeout=2.0)
                 if self._stop_event.is_set():
                     break
+                
+                # Check for poison pill
+                if task[2] == -1:
+                    break
+                    
                 self._process_chunk(task)
             except Empty:
                 # Queue idle chunks when nothing else to do
                 if len(self._processed_chunks) >= self.total_chunks:
                     break
                 self._queue_idle_chunk()
+            except Exception as e:
+                logger.error(f"{self._log_prefix} Worker loop error: {e}", exc_info=True)
+                time.sleep(1.0)
         
         if not self._stop_event.is_set():
             logger.info(f"{self._log_prefix} All {len(self._processed_chunks)} chunks processed")
@@ -247,17 +258,22 @@ class TranscriptionEngine:
     def _process_chunk(self, task: tuple[float, float, int]) -> None:
         """Process a single transcription chunk."""
         start_time, end_time, chunk_idx = task
+        start_perf = time.perf_counter()
         
         try:
-            # Wait for transcriber to be fully loaded
+            # Wait for transcriber to be fully loaded with timeout
             if not self.transcriber.is_loaded:
-                logger.debug(f"{self._log_prefix} Waiting for transcription model to finish loading...")
+                logger.debug(f"{self._log_prefix} Waiting for transcription model (chunk {chunk_idx})...")
+                wait_start = time.time()
                 while not self.transcriber.is_loaded and not self._stop_event.is_set():
+                    if time.time() - wait_start > 300: # 5 minute sanity timeout
+                        raise RuntimeError("Transcription model failed to load within 5 minutes")
+                        
                     if hasattr(self.transcriber, 'wait_for_load'):
                         if self.transcriber.wait_for_load(1.0):
                             break
                     else:
-                        time.sleep(0.5)
+                        time.sleep(1.0)
                         
                 if self._stop_event.is_set():
                     return
@@ -265,7 +281,7 @@ class TranscriptionEngine:
             # Read audio chunk
             audio_data = self._audio.read_chunk(start_time, end_time)
             if not audio_data:
-                logger.warning(f"{self._log_prefix} No audio data for chunk {chunk_idx}")
+                logger.warning(f"{self._log_prefix} No audio data for chunk {chunk_idx} ({start_time:.1f}s-{end_time:.1f}s)")
                 return
             
             # Transcribe
@@ -275,23 +291,27 @@ class TranscriptionEngine:
                 return
             
             if result.is_empty:
-                logger.debug(f"{self._log_prefix} Chunk {chunk_idx} had no speech")
+                logger.debug(f"{self._log_prefix} Chunk {chunk_idx} processed (no speech detected)")
                 return
             
             # Add words to subtitle writer
             count = self._subtitle_writer.add_words(result.words, time_offset=start_time)
             
+            elapsed = time.perf_counter() - start_perf
             if count > 0:
-                logger.info(f"{self._log_prefix} Added {count} segments from chunk {chunk_idx}")
+                logger.info(f"{self._log_prefix} Chunk {chunk_idx} done: added {count} segments in {elapsed:.2f}s")
                 self._rewrite_needed.set()
+            else:
+                logger.debug(f"{self._log_prefix} Chunk {chunk_idx} done: no segments added (duration: {elapsed:.2f}s)")
             
-            # Report progress (even on failure to ensure UI reaches 100%)
+            # Report progress
             if self.on_progress:
                 processed = len(self._processed_chunks) + 1
                 self.on_progress(processed, self.total_chunks)
                 
         except Exception as e:
-            logger.error(f"{self._log_prefix} Chunk {chunk_idx} failed: {e}", exc_info=True)
+            logger.error(f"{self._log_prefix} Failed to process chunk {chunk_idx}: {e}", exc_info=True)
+            # Re-queue if it was a transient error? For now just log and move on to prioritize playback
         finally:
             with self._queue_lock:
                 self._queued_chunks.discard(start_time)

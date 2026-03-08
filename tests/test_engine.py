@@ -11,11 +11,11 @@ def test_engine_clear_queue():
         config=ServiceConfig(transcription=TranscriptionConfig(), subtitle=SubtitleConfig())
     )
     
-    eng._task_queue.put((0, (0.0, 1.0, b"active1")))
-    eng._task_queue.put((1, (1.0, 2.0, b"active2")))
+    eng._task_queue.put((0, (0.0, 1.0, 0)))
+    eng._task_queue.put((1, (1.0, 2.0, 1)))
     
-    eng._task_queue.put((TranscriptionEngine.IDLE_PRIORITY_OFFSET, (2.0, 3.0, b"idle1")))
-    eng._task_queue.put((TranscriptionEngine.IDLE_PRIORITY_OFFSET + 1, (3.0, 4.0, b"idle2")))
+    eng._task_queue.put((TranscriptionEngine.IDLE_PRIORITY_OFFSET, (2.0, 3.0, 2)))
+    eng._task_queue.put((TranscriptionEngine.IDLE_PRIORITY_OFFSET + 1, (3.0, 4.0, 3)))
     
     eng._clear_queue()
     

@@ -64,14 +64,10 @@ class SubtitleService:
         # Set up MPV event handlers IMMEDIATELY (no stalling)
         self._setup_observers()
         
-        # Check if a video is already playing
-        if self._mpv.path:
-            self._on_path_change(None, self._mpv.path)
-            
         # Start model loading in the background
         threading.Thread(target=self._background_load, daemon=True, name="ModelLoader").start()
         
-        logger.info("Subtitle service started")
+        logger.info("Subtitle service started and model loading initiated")
         
     def _background_load(self) -> None:
         """Background worker for loading the model."""
@@ -81,7 +77,10 @@ class SubtitleService:
                 self._mpv.show_osd("AI Subtitle Service: Ready", 3000)
                 self._mpv.send_message("ai-subs/ready")
         except Exception as e:
-            logger.error(f"Background loading failed: {e}")
+            logger.critical(f"Background model loading failed: {e}")
+            if self._mpv:
+                self._mpv.show_osd(f"AI Service: Model Load Failed - {e}", 15000)
+                self._mpv.send_message("ai-subs/error", str(e))
             self._running = False
     
     def run(self) -> None:
@@ -163,7 +162,7 @@ class SubtitleService:
         # Clean up old engine
         if self._current_engine:
             video_path = self._current_engine.video_path
-            logger.info(f"Cleaning up engine for: {os.path.basename(video_path)}")
+            logger.info(f"Closing previous engine for: {os.path.basename(video_path)}")
             self._current_engine.stop()
             self._engines.pop(video_path, None)
         

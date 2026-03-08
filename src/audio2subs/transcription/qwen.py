@@ -42,8 +42,15 @@ class QwenTranscriber(BaseTranscriber):
         logger.info(f"Loading Qwen model: {self.config.model_name}")
 
         try:
-            import torch
-            from qwen_asr import Qwen3ASRModel
+            try:
+                import torch
+                from qwen_asr import Qwen3ASRModel
+            except ImportError as e:
+                missing_pkg = str(e).split("'")[-2] if "'" in str(e) else "required dependencies"
+                error_msg = f"Missing dependency: {missing_pkg}. Please run 'pip install qwen-asr torch numpy'."
+                logger.critical(error_msg)
+                self._loaded_event.set()
+                raise TranscriptionError(error_msg) from e
 
             device = self.config.get_device()
             
@@ -52,12 +59,18 @@ class QwenTranscriber(BaseTranscriber):
             if device == "cuda":
                 if torch.cuda.is_available():
                     caps = torch.cuda.get_device_capability()
-                    if caps[0] >= 8:  # Ampere or newer supports bfloat16 natively
+                    # Ampere (8.0), Ada (8.9), Blackwell (9.0) support bfloat16
+                    if caps[0] >= 8:
                         dtype = torch.bfloat16
+                        logger.debug(f"Device capability {caps} >= 8.0, using bfloat16")
                     else:
                         dtype = torch.float16
+                        logger.debug(f"Device capability {caps} < 8.0, using float16")
+                else:
+                    logger.warning("CUDA device requested but torch.cuda.is_available() is False. Falling back to CPU/float32.")
+                    device = "cpu"
 
-            logger.debug(f"Loading on {device} with dtype {dtype}")
+            logger.info(f"Loading Qwen model on {device} with dtype {dtype}")
 
             self._model = Qwen3ASRModel.from_pretrained(
                 self.config.model_name,
@@ -80,7 +93,9 @@ class QwenTranscriber(BaseTranscriber):
             self._is_loaded = False
             self._loaded_event.set()
             self._model = None
-            raise TranscriptionError(f"Failed to load Qwen model: {e}") from e
+            if not isinstance(e, TranscriptionError):
+                raise TranscriptionError(f"Failed to load Qwen model: {e}") from e
+            raise
 
     def transcribe(self, audio_buffer: bytes) -> TranscriptionResult:
         """Transcribe raw PCM audio using Qwen3 ASR.
@@ -141,7 +156,7 @@ class QwenTranscriber(BaseTranscriber):
             # If forced aligner failed but we have text, we return empty words
             # The engine requires words for subtitle generation.
             if not words and result.text:
-                logger.warning("No timestamps returned from Qwen forced aligner.")
+                logger.warning(f"No timestamps returned for chunk ({len(audio_buffer)} bytes). Alignment failed.")
 
             return TranscriptionResult(
                 words=words,
