@@ -11,10 +11,9 @@
 local mp = require 'mp'
 local utils = require 'mp.utils'
 
--- Configuration
 local config = {
     client_name = "ai_subtitle_service",
-    python_script = utils.join_path(mp.get_script_directory(), 'main.py'),
+    python_script = mp.get_script_directory() and utils.join_path(mp.get_script_directory(), 'main.py') or 'main.py',
     startup_timeout = 120, -- seconds to wait for model load
     osd_duration = 3000,   -- ms for normal OSD messages
 }
@@ -48,6 +47,9 @@ end
 -- Note: utils.join_path() only takes 2 args, must chain calls
 local function get_python_executable()
     local script_dir = mp.get_script_directory()
+    if not script_dir then
+        return nil
+    end
     
     -- Try Windows path first: venv/Scripts/python.exe
     local venv_dir = utils.join_path(script_dir, 'venv')
