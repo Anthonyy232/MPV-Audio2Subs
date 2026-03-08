@@ -70,7 +70,21 @@ class QwenTranscriber(BaseTranscriber):
                     logger.warning("CUDA device requested but torch.cuda.is_available() is False. Falling back to CPU/float32.")
                     device = "cpu"
 
+            # Use flash_attn if available (requires bfloat16/float16)
+            use_flash_attn = False
+            if dtype in (torch.bfloat16, torch.float16):
+                try:
+                    import flash_attn  # noqa: F401
+                    use_flash_attn = True
+                    logger.info("Flash Attention 2 enabled")
+                except ImportError:
+                    pass
+
+            attn_impl = "flash_attention_2" if use_flash_attn else None
+
             logger.info(f"Loading Qwen model on {device} with dtype {dtype}")
+
+            fa_kwargs = {"attn_implementation": attn_impl} if attn_impl else {}
 
             self._model = Qwen3ASRModel.from_pretrained(
                 self.config.model_name,
@@ -82,7 +96,9 @@ class QwenTranscriber(BaseTranscriber):
                 forced_aligner_kwargs=dict(
                     dtype=dtype,
                     device_map=device,
+                    **fa_kwargs,
                 ),
+                **fa_kwargs,
             )
 
             self._is_loaded = True

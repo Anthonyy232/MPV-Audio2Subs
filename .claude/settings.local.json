@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./venv/Scripts/python:*)",
+      "Bash(./venv/Scripts/pip install:*)",
+      "Bash(\"F:/Coding/MpvSnc/MPV-Audio2Subs/venv/Scripts/python.exe\":*)",
+      "Bash(python:*)",
+      "Bash(uv pip:*)"
+    ]
+  }
+}

@@ -82,10 +82,37 @@ MPV-Audio2Subs/
 └── requirements.txt
 ```
 
+## ⚡ Flash Attention 2 (Optional, Recommended)
+
+Flash Attention 2 speeds up transcription, especially for longer audio. Because it requires a prebuilt binary matching your exact Python, PyTorch, and CUDA versions, it must be installed manually.
+
+**Step 1 — Check your versions:**
+```bash
+python -c "import sys, torch; print(f'Python: {sys.version.split()[0]}'); print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.version.cuda}')"
+```
+
+Example output:
+```
+Python: 3.11.9
+PyTorch: 2.10.0+cu128
+CUDA: 12.8
+```
+
+**Step 2 — Find and install the matching wheel:**
+
+Go to [mjunya.com/flash-attention-prebuild-wheels](https://mjunya.com/flash-attention-prebuild-wheels/) and download the wheel matching your `cpXYZ` (Python), `cuXYZ` (CUDA), and `torchX.Y` versions.
+
+For example, Python 3.11 + CUDA 12.8 + PyTorch 2.10:
+```bash
+pip install "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.13/flash_attn-2.8.3+cu128torch2.10-cp311-cp311-win_amd64.whl"
+```
+
+Once installed, the service auto-detects it — you'll see `Flash Attention 2 enabled` in the log on next startup.
+
 ## ⚙️ Configuration
 
 Environment variables:
-- `AUDIO2SUBS_CHUNK_DURATION` - Chunk size in seconds (default: 300)
+- `AUDIO2SUBS_CHUNK_DURATION` - Chunk size in seconds (default: 30)
 - `AUDIO2SUBS_PERSISTENT_MODE` - Keep model in memory (1/true)
 - `AUDIO2SUBS_CPU_ONLY` - Force CPU mode (1/true)
 
@@ -100,8 +127,9 @@ Environment variables:
 - Check that FFmpeg can read the video
 
 **Slow Performance**
-- Ensure CUDA is available (`python -c "import torch; print(torch.cuda.is_available())"`)
-- Increase chunk duration for longer batches
+- Verify CUDA is available and your versions with the command above
+- Install Flash Attention 2 (see above)
+- Check `subtitle_service.log` for `Flash Attention 2 enabled` to confirm it's active
 
 ## 🔒 Privacy
 
