@@ -77,7 +77,7 @@ class QwenTranscriber(BaseTranscriber):
                 dtype=dtype,
                 device_map=device,
                 max_inference_batch_size=32,
-                max_new_tokens=4096,
+                max_new_tokens=512,
                 forced_aligner="Qwen/Qwen3-ForcedAligner-0.6B",
                 forced_aligner_kwargs=dict(
                     dtype=dtype,

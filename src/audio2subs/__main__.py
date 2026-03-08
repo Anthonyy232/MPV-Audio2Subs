@@ -40,7 +40,7 @@ def main() -> int:
     parser.add_argument(
         "--chunk-duration",
         type=int,
-        default=300,
+        default=30,
         help="Audio chunk duration in seconds"
     )
     parser.add_argument(

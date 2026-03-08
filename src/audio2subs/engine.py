@@ -283,8 +283,9 @@ class TranscriptionEngine:
             if not audio_data:
                 logger.warning(f"{self._log_prefix} No audio data for chunk {chunk_idx} ({start_time:.1f}s-{end_time:.1f}s)")
                 return
-            
+
             # Transcribe
+            logger.info(f"{self._log_prefix} Transcribing chunk {chunk_idx} ({start_time:.1f}s-{end_time:.1f}s, {len(audio_data)//2000:.0f}KB)...")
             result = self.transcriber.transcribe(audio_data)
             
             if self._stop_event.is_set():
