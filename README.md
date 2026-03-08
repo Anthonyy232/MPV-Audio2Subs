@@ -29,13 +29,13 @@ This installs the Python AI engine globally so you only need `main.lua` in your 
 1. **Install the AI engine:**
 ```bash
 # Using uv (Recommended - installs with optional ASR dependencies)
-uv tool install git+https://github.com/Anthonyy232/MPV-Audio2Subs.git --with asr
+uv tool install "git+https://github.com/Anthonyy232/MPV-Audio2Subs.git#egg=audio2subs[asr]"
 
 # (Optional) If you have an RTX 50 series GPU and need CUDA 12.8, add the PyTorch index:
-# uv tool install git+https://github.com/Anthonyy232/MPV-Audio2Subs.git --with asr --index-url https://download.pytorch.org/whl/cu128
+# uv tool install "git+https://github.com/Anthonyy232/MPV-Audio2Subs.git#egg=audio2subs[asr]" --index-url https://download.pytorch.org/whl/cu128
 
 # OR using pipx
-pipx install git+https://github.com/Anthonyy232/MPV-Audio2Subs.git[asr]
+pipx install "git+https://github.com/Anthonyy232/MPV-Audio2Subs.git#egg=audio2subs[asr]"
 ```
 
 2. **Install the MPV script:**
