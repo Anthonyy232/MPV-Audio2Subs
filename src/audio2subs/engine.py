@@ -29,6 +29,7 @@ class TranscriptionEngine:
     """
     
     IDLE_PRIORITY_OFFSET = 1_000_000.0
+    BATCH_SIZE = 16  # max chunks per GPU inference call
     
     def __init__(
         self,
@@ -92,6 +93,7 @@ class TranscriptionEngine:
         self._queued_chunks: set[float] = set()
         self._last_known_time = 0.0
         self._idle_pointer = 0
+        self._first_task_done = False  # first task processed alone for fast time-to-first-subtitle
         
         # Worker threads
         self._worker_thread: threading.Thread | None = None
@@ -208,20 +210,46 @@ class TranscriptionEngine:
                 break
             
             try:
-                priority, task = self._task_queue.get(timeout=2.0)
+                priority, first_task = self._task_queue.get(timeout=0.5)
                 if self._stop_event.is_set():
                     break
-                
+
                 # Check for poison pill
-                if task[2] == -1:
+                if first_task[2] == -1:
                     break
-                    
-                self._process_chunk(task)
+
+                # Always process the very first task alone so the first subtitle
+                # appears as fast as possible. Batching would delay TTF because
+                # we'd need audio for all N chunks before inference starts.
+                if not self._first_task_done:
+                    self._first_task_done = True
+                    self._process_chunk(first_task)
+                else:
+                    # Greedily collect additional tasks for batched inference.
+                    # Track priorities so extras can be correctly re-enqueued if needed.
+                    batch = [first_task]
+                    extra_priorities: list[float] = []
+                    while len(batch) < self.BATCH_SIZE:
+                        try:
+                            extra_p, extra_task = self._task_queue.get_nowait()
+                            if extra_task[2] == -1:
+                                # Return poison pill and stop collecting
+                                self._task_queue.put((-1, (0.0, 0.0, -1)))
+                                break
+                            batch.append(extra_task)
+                            extra_priorities.append(extra_p)
+                        except Empty:
+                            break
+
+                    if len(batch) == 1:
+                        self._process_chunk(batch[0])
+                    else:
+                        self._process_batch(batch)
             except Empty:
                 # Queue idle chunks when nothing else to do
                 if len(self._processed_chunks) >= self.total_chunks:
                     break
-                self._queue_idle_chunk()
+                self._queue_all_idle_chunks()
             except Exception as e:
                 logger.error(f"{self._log_prefix} Worker loop error: {e}", exc_info=True)
                 time.sleep(1.0)
@@ -322,6 +350,89 @@ class TranscriptionEngine:
             except ValueError:
                 pass
     
+    def _process_batch(self, tasks: list[tuple[float, float, int]]) -> None:
+        """Process multiple chunks in a single batched model call.
+
+        Reads audio for all tasks, runs one batch inference, then distributes
+        results. Each task is marked processed in the finally block.
+        """
+        start_perf = time.perf_counter()
+        chunk_ids = [t[2] for t in tasks]
+        logger.info(f"{self._log_prefix} Batch processing {len(tasks)} chunks: {chunk_ids}")
+
+        # Wait for model load (same as _process_chunk)
+        if not self.transcriber.is_loaded:
+            wait_start = time.time()
+            while not self.transcriber.is_loaded and not self._stop_event.is_set():
+                if time.time() - wait_start > 300:
+                    raise RuntimeError("Transcription model failed to load within 5 minutes")
+                if hasattr(self.transcriber, 'wait_for_load'):
+                    if self.transcriber.wait_for_load(1.0):
+                        break
+                else:
+                    time.sleep(1.0)
+            if self._stop_event.is_set():
+                return
+
+        # Read audio for all tasks; keep track of which have valid data
+        audio_buffers: list[bytes | None] = []
+        for start_time, end_time, chunk_idx in tasks:
+            try:
+                data = self._audio.read_chunk(start_time, end_time)
+                audio_buffers.append(data if data else None)
+                if not data:
+                    logger.warning(f"{self._log_prefix} No audio for chunk {chunk_idx}")
+            except Exception as e:
+                logger.error(f"{self._log_prefix} Audio read failed for chunk {chunk_idx}: {e}")
+                audio_buffers.append(None)
+
+        # Build list of (task, buffer) pairs that have valid audio
+        valid_pairs = [
+            (tasks[i], audio_buffers[i])
+            for i in range(len(tasks))
+            if audio_buffers[i] is not None
+        ]
+
+        if valid_pairs and not self._stop_event.is_set():
+            try:
+                valid_tasks = [p[0] for p in valid_pairs]
+                valid_bufs = [p[1] for p in valid_pairs]
+                results = self.transcriber.transcribe_batch(valid_bufs)
+
+                any_new = False
+                for (start_time, end_time, chunk_idx), result in zip(valid_tasks, results):
+                    if result.is_empty:
+                        logger.debug(f"{self._log_prefix} Chunk {chunk_idx}: no speech")
+                        continue
+                    count = self._subtitle_writer.add_words(result.words, time_offset=start_time)
+                    if count > 0:
+                        any_new = True
+                        logger.debug(f"{self._log_prefix} Chunk {chunk_idx}: added {count} segments")
+
+                elapsed = time.perf_counter() - start_perf
+                logger.info(
+                    f"{self._log_prefix} Batch {chunk_ids} done in {elapsed:.2f}s "
+                    f"({elapsed/len(tasks):.2f}s/chunk)"
+                )
+                if any_new:
+                    self._rewrite_needed.set()
+
+            except Exception as e:
+                logger.error(f"{self._log_prefix} Batch transcription failed: {e}", exc_info=True)
+
+        # Mark all tasks processed and release queue slots
+        for start_time, _end_time, _chunk_idx in tasks:
+            with self._queue_lock:
+                self._queued_chunks.discard(start_time)
+                self._processed_chunks.add(start_time)
+            try:
+                self._task_queue.task_done()
+            except ValueError:
+                pass
+
+        if self.on_progress:
+            self.on_progress(len(self._processed_chunks), self.total_chunks)
+
     def _write_subtitles(self) -> None:
         """Write the subtitle file."""
         try:
@@ -349,17 +460,37 @@ class TranscriptionEngine:
         with self._queue_lock:
             while self._idle_pointer < self.total_chunks:
                 start_time = self._idle_pointer * self.chunk_duration
-                
+
                 if start_time not in self._processed_chunks and start_time not in self._queued_chunks:
                     end_time = min(start_time + self.chunk_duration, self.duration)
                     priority = self.IDLE_PRIORITY_OFFSET + self._idle_pointer
-                    
+
                     logger.debug(f"{self._log_prefix} Queuing idle chunk {self._idle_pointer}")
                     self._queued_chunks.add(start_time)
                     self._task_queue.put((priority, (start_time, end_time, self._idle_pointer)))
                     self._idle_pointer += 1
                     return
-                
+
+                self._idle_pointer += 1
+
+    def _queue_all_idle_chunks(self) -> None:
+        """Queue ALL remaining unprocessed chunks at low priority in one pass.
+
+        Called when the worker queue runs dry so the worker never stalls waiting
+        for the 2-second get() timeout to fire chunk by chunk.
+        """
+        with self._queue_lock:
+            while self._idle_pointer < self.total_chunks:
+                start_time = self._idle_pointer * self.chunk_duration
+
+                if start_time not in self._processed_chunks and start_time not in self._queued_chunks:
+                    end_time = min(start_time + self.chunk_duration, self.duration)
+                    priority = self.IDLE_PRIORITY_OFFSET + self._idle_pointer
+
+                    logger.debug(f"{self._log_prefix} Queuing idle chunk {self._idle_pointer}")
+                    self._queued_chunks.add(start_time)
+                    self._task_queue.put((priority, (start_time, end_time, self._idle_pointer)))
+
                 self._idle_pointer += 1
     
     def _clear_queue(self) -> None:

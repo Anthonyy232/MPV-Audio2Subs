@@ -183,6 +183,67 @@ class QwenTranscriber(BaseTranscriber):
             logger.error(f"Qwen transcription failed: {e}", exc_info=True)
             raise TranscriptionError(f"Transcription failed: {e}") from e
 
+    def transcribe_batch(self, audio_buffers: list[bytes]) -> list[TranscriptionResult]:
+        """Transcribe multiple raw PCM buffers in a single model call.
+
+        Passes all audio inputs to the model as a batch so the GPU processes
+        them in parallel, reducing per-chunk overhead significantly.
+
+        Args:
+            audio_buffers: List of raw PCM bytes (16kHz, mono, 16-bit)
+
+        Returns:
+            List of TranscriptionResult, one per buffer, in the same order.
+        """
+        if not self._is_loaded or self._model is None:
+            raise TranscriptionError("Qwen model is not loaded")
+        if not audio_buffers:
+            return []
+
+        try:
+            import numpy as np
+
+            audio_inputs = []
+            for buf in audio_buffers:
+                if not buf:
+                    audio_inputs.append((np.zeros(SAMPLE_RATE, dtype=np.float32), SAMPLE_RATE))
+                    continue
+                arr = np.frombuffer(buf, dtype=np.int16)
+                flt = arr.astype(np.float32) / 32768.0
+                audio_inputs.append((flt, SAMPLE_RATE))
+
+            raw_results = self._model.transcribe(
+                audio=audio_inputs,
+                language="English",
+                return_time_stamps=True,
+            )
+
+            output: list[TranscriptionResult] = []
+            for result in raw_results:
+                if not result or not result.text:
+                    output.append(TranscriptionResult())
+                    continue
+
+                words = []
+                if result.time_stamps:
+                    for ts in result.time_stamps:
+                        words.append(WordTimestamp(
+                            word=ts.text,
+                            start=float(ts.start_time),
+                            end=float(ts.end_time),
+                        ))
+
+                if not words and result.text:
+                    logger.warning(f"No timestamps in batch result. Alignment failed.")
+
+                output.append(TranscriptionResult(words=words, full_text=result.text.strip()))
+
+            return output
+
+        except Exception as e:
+            logger.error(f"Batch transcription failed: {e}", exc_info=True)
+            raise TranscriptionError(f"Batch transcription failed: {e}") from e
+
     def close(self) -> None:
         """Release the model from memory."""
         super().close()

@@ -182,7 +182,7 @@ class AudioExtractor:
                         except OSError:
                             pass
                     
-                    time.sleep(0.5)
+                    time.sleep(0.05)
                 
                 if process.returncode != 0:
                     stderr = process.stderr.read().decode(errors='ignore') if process.stderr else "No stderr output"

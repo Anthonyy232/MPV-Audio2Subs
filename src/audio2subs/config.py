@@ -63,7 +63,7 @@ class ServiceConfig:
     auto_select_subtitle: bool = True  # Auto-select AI subs on first generation
     
     # Subtitle rewrite throttling
-    rewrite_throttle_seconds: float = 3.0
+    rewrite_throttle_seconds: float = 1.0
     
     # Logging
     log_level: str = "INFO"
