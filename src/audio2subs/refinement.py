@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -10,16 +11,21 @@ from audio2subs.config import RefinementConfig
 
 logger = logging.getLogger(__name__)
 
+_NUMBERED_LINE_RE = re.compile(r"^\d+\.\s*(.*)")
+
+_SYSTEM_PROMPT = (
+    "You are a subtitle post-processor. "
+    "You will receive numbered subtitle lines. "
+    "Fix punctuation, capitalization, and obvious grammatical errors in each line. "
+    "Remove obvious filler words ('uh', 'um', 'hmm') but preserve every other word exactly. "
+    "Output ONLY the same numbered lines in the same order, nothing else."
+)
+
 
 class QwenRefiner:
     """Refines subtitle text using Qwen3-0.6B for better punctuation and formatting."""
 
     def __init__(self, config: RefinementConfig):
-        """Initialize the Qwen refiner.
-
-        Args:
-            config: Refinement configuration
-        """
         self.config = config
         self._model: Any = None
         self._tokenizer: Any = None
@@ -47,24 +53,20 @@ class QwenRefiner:
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
             device = self.config.get_device()
-            
-            # Determine dtype
+
             dtype = "auto"
             if device == "cuda" and torch.cuda.is_available():
                 caps = torch.cuda.get_device_capability()
-                if caps[0] >= 8:
-                    dtype = torch.bfloat16
-                    logger.debug("Using bfloat16 for refinement model")
-                else:
-                    dtype = torch.float16
-                    logger.debug("Using float16 for refinement model")
+                dtype = torch.bfloat16 if caps[0] >= 8 else torch.float16
+                logger.debug(f"Using {dtype} for refinement model")
 
             self._tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.config.model_name,
                 torch_dtype=dtype,
-                device_map=device
+                device_map=device,
             )
+            self._model.eval()
 
             self._is_loaded = True
             elapsed = time.perf_counter() - start_time
@@ -82,7 +84,7 @@ class QwenRefiner:
             texts: List of raw subtitle strings
 
         Returns:
-            List of refined subtitle strings
+            List of refined subtitle strings (same length as input)
         """
         if not self._is_loaded or not self._model:
             return texts
@@ -90,114 +92,100 @@ class QwenRefiner:
         if not texts:
             return []
 
-        # Join texts with a marker to process in larger chunks if needed,
-        # but for subtitles, we might want to process them as a single block 
-        # to maintain consistency.
-        full_text = "\n".join(texts)
-        
-        refined_full = self.refine_text(full_text)
+        # Numbered format: "1. text\n2. text\n..." lets the model track lines
+        # explicitly and makes parsing back unambiguous.
+        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+        refined_raw = self._generate(numbered)
+        return self._parse_numbered(refined_raw, texts)
 
-        # Split back - strip trailing whitespace first to avoid spurious empty lines
-        # from a model that appends a trailing newline
-        refined_lines = refined_full.strip().split("\n")
-        
-        # If the LLM changed the line count, we have a mapping problem.
-        # For now, let's try to keep it simple: one prompt per meaningful block.
-        if len(refined_lines) != len(texts):
-            logger.warning(
-                f"Refinement changed line count: {len(texts)} -> {len(refined_lines)}. "
-                "Falling back to original line count mapping."
-            )
-            # Basic fallback: if it's close, we might try to align, but safest is 
-            # to return what we can or the original.
-            if len(refined_lines) > len(texts):
-                return refined_lines[:len(texts)]
-            else:
-                return refined_lines + texts[len(refined_lines):]
+    def _parse_numbered(self, raw: str, originals: list[str]) -> list[str]:
+        """Parse numbered output back to a plain list.
 
-        return refined_lines
-
-    def refine_text(self, text: str) -> str:
-        """Refine a block of text.
-
-        Args:
-            text: Raw text block
-
-        Returns:
-            Refined text block
+        Falls back to original text for any line that can't be parsed.
         """
+        result = list(originals)  # start with originals as fallback
+
+        for line in raw.strip().splitlines():
+            m = _NUMBERED_LINE_RE.match(line.strip())
+            if not m:
+                continue
+            # Extract the 1-based index from the prefix
+            dot = line.index(".")
+            try:
+                idx = int(line[:dot].strip()) - 1
+            except ValueError:
+                continue
+            if 0 <= idx < len(result):
+                result[idx] = m.group(1).strip()
+
+        return result
+
+    def _generate(self, user_text: str) -> str:
+        """Run the model and return the raw generated string."""
         if not self._is_loaded or not self._model or not self._tokenizer:
-            return text
+            return user_text
 
         try:
             import torch
-            
-            prompt = (
-                "You are a subtitle post-processor. Clean up the following transcript by fixing "
-                "punctuation, capitalization, and minor grammatical errors. "
-                "DO NOT change the meaning or remove any words unless they are obvious filler (like 'uh', 'um'). "
-                "Maintain the same number of lines. Each line corresponds to a timing segment.\n\n"
-                f"Transcript:\n{text}"
-            )
 
             messages = [
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
             ]
 
-            # Use chat template based on config
             formatted_input = self._tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=self.config.enable_thinking
+                enable_thinking=self.config.enable_thinking,
             )
 
             inputs = self._tokenizer([formatted_input], return_tensors="pt").to(self._model.device)
+            input_len = inputs.input_ids.shape[1]
 
-            # Sampling parameters based on documentation
+            # Budget: output shouldn't exceed ~2× the input token count.
+            # Clamp between 64 and 4096 to handle edge cases.
+            max_new = max(64, min(4096, input_len * 2))
+
             if self.config.enable_thinking:
-                gen_config = {
+                gen_config: dict[str, Any] = {
+                    "do_sample": True,
                     "temperature": 0.6,
                     "top_p": 0.95,
                     "top_k": 20,
-                    "min_p": 0,
                 }
             else:
-                gen_config = {
-                    "temperature": 0.7,
-                    "top_p": 0.8,
-                    "top_k": 20,
-                    "min_p": 0,
-                }
+                # Greedy for deterministic, fast text-cleaning
+                gen_config = {"do_sample": False}
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 generated_ids = self._model.generate(
                     **inputs,
-                    max_new_tokens=4096,  # Should be enough for a batch of subs
-                    **gen_config
+                    max_new_tokens=max_new,
+                    pad_token_id=self._tokenizer.eos_token_id,
+                    **gen_config,
                 )
 
-            # Extract output
-            input_len = inputs.input_ids.shape[1]
             output_ids = generated_ids[0][input_len:].tolist()
 
-            # Handle thinking content if enabled
+            # Strip thinking tokens when enabled
             index = 0
             if self.config.enable_thinking:
                 try:
-                    # rindex finding 151668 (</think>)
-                    index = len(output_ids) - output_ids[::-1].index(151668)
+                    index = len(output_ids) - output_ids[::-1].index(151668)  # </think>
                 except ValueError:
                     index = 0
 
-            # result_thinking = self._tokenizer.decode(output_ids[:index], skip_special_tokens=True).strip()
-            result_content = self._tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip()
-
-            return result_content
+            return self._tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip()
 
         except Exception as e:
             logger.error(f"Refinement generation failed: {e}", exc_info=True)
-            return text
+            return user_text
+
+    # Legacy public API — kept for callers that use refine_text directly
+    def refine_text(self, text: str) -> str:
+        """Refine a raw text block (single LLM call, no numbered formatting)."""
+        return self._generate(text)
 
     def close(self) -> None:
         """Unload the model and free memory."""
