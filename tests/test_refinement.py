@@ -134,7 +134,7 @@ def test_refinement_env_vars():
 def test_refinement_env_vars_defaults():
     with patch.dict(os.environ, {}, clear=False):
         config = ServiceConfig.from_env()
-    assert config.refinement.enabled is False
+    assert config.refinement.enabled is True
     assert config.refinement.model_name == "Qwen/Qwen3-0.6B"
     assert config.refinement.enable_thinking is False
 
