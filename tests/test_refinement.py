@@ -123,3 +123,17 @@ def test_refiner_close_unloaded():
     refiner = QwenRefiner(config)
     refiner.close()  # Should not raise
     assert not refiner.is_loaded
+
+def test_refine_batch_unloaded():
+    """refine_batch on unloaded refiner returns originals unchanged."""
+    config = RefinementConfig(enabled=True, device="cpu")
+    refiner = QwenRefiner(config)
+    texts = ["line 1", "line 2"]
+    result = refiner.refine_batch(texts)
+    assert result == texts
+
+def test_refine_text_unloaded():
+    """refine_text on unloaded refiner returns text unchanged."""
+    config = RefinementConfig(enabled=True, device="cpu")
+    refiner = QwenRefiner(config)
+    assert refiner.refine_text("hello") == "hello"
