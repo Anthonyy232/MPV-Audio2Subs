@@ -264,26 +264,26 @@ class TranscriptionEngine:
         if not self._stop_event.is_set() and self._refiner:
             try:
                 logger.info(f"{self._log_prefix} Starting subtitle refinement...")
-                
+
                 # UNLOAD ASR model first to free VRAM
                 logger.info(f"{self._log_prefix} Unloading ASR model to free VRAM for refinement...")
                 self.transcriber.close()
-                
+
                 # Load Refiner
                 self._refiner.load()
-                
+
                 # Perform refinement
                 count = self._subtitle_writer.refine(self._refiner)
-                
+
                 if count > 0:
                     logger.info(f"{self._log_prefix} Refinement complete: {count} segments polished")
                     self._rewrite_needed.set()
-                
-                # Unload Refiner
-                self._refiner.close()
-                
+
             except Exception as e:
                 logger.error(f"{self._log_prefix} Refinement failed: {e}", exc_info=True)
+            finally:
+                # Always unload refiner to free VRAM
+                self._refiner.close()
 
         if not self._stop_event.is_set():
             logger.info(f"{self._log_prefix} All {len(self._processed_chunks)} chunks processed")
