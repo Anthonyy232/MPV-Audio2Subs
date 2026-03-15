@@ -17,6 +17,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Window used to detect hallucination runs (same phrase repeated across chunks)
+_HALLU_WINDOW_S = 90.0
+# Minimum text length to apply hallucination dedup (short words like "Yes" can repeat)
+_HALLU_MIN_LEN = 15
+
+
+def _is_cjk_char(ch: str) -> bool:
+    """Return True if the character is in a CJK Unicode block."""
+    cp = ord(ch)
+    return (
+        0x3040 <= cp <= 0x30FF  # Hiragana / Katakana
+        or 0x3400 <= cp <= 0x4DBF  # CJK Extension A
+        or 0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0xAC00 <= cp <= 0xD7AF  # Hangul Syllables
+        or 0xFF00 <= cp <= 0xFFEF  # Full-width forms
+    )
+
 
 @dataclass
 class SubtitleSegment:
@@ -139,7 +156,21 @@ class SubtitleWriter:
                         for existing in new_segments
                     )
                 
-                if not is_duplicate:
+                # Hallucination guard: same long phrase repeated within 60 s is
+                # almost certainly a Whisper hallucination, not real speech.
+                is_hallucination = False
+                if not is_duplicate and len(seg.text) >= _HALLU_MIN_LEN:
+                    hallu_start = seg.start - _HALLU_WINDOW_S
+                    h_left = bisect.bisect_left(starts, hallu_start)
+                    is_hallucination = any(
+                        existing.text == seg.text
+                        for existing in self._segments[h_left:]
+                    ) or any(
+                        existing.text == seg.text and existing.start >= hallu_start
+                        for existing in new_segments
+                    )
+
+                if not is_duplicate and not is_hallucination:
                     new_segments.append(seg)
                     added += 1
             
@@ -167,7 +198,7 @@ class SubtitleWriter:
             
             # Batch segments to avoid hitting LLM context limits too hard, 
             # and to allow some incremental progress/error handling.
-            batch_size = 50 
+            batch_size = 25
             refined_count = 0
             
             for i in range(0, len(self._segments), batch_size):
@@ -177,9 +208,9 @@ class SubtitleWriter:
                 try:
                     refined_texts = refiner.refine_batch(texts)
                     
-                    # Update segments
+                    # Update segments (skip if model returned empty)
                     for j, refined_text in enumerate(refined_texts):
-                        if j < len(batch):
+                        if j < len(batch) and refined_text.strip():
                             batch[j].text = refined_text
                             refined_count += 1
                 except Exception as e:
@@ -200,7 +231,16 @@ class SubtitleWriter:
         cfg = self.config
         initial_segments: list[SubtitleSegment] = []
         current_line_words: list[WordTimestamp] = []
-        
+
+        # Strip CJK characters from words; skip words that are entirely non-English.
+        # This removes Japanese/Chinese text that Qwen-ASR picks up from anime audio.
+        cleaned_words: list[WordTimestamp] = []
+        for w in words:
+            cleaned = "".join(c for c in w.word if not _is_cjk_char(c)).strip()
+            if cleaned:
+                cleaned_words.append(WordTimestamp(word=cleaned, start=w.start, end=w.end))
+        words = cleaned_words
+
         for i, word in enumerate(words):
             current_line_words.append(word)
             current_text = " ".join(w.word for w in current_line_words)

@@ -24,6 +24,7 @@ dependencies = [
 asr = [
     "qwen-asr @ git+https://github.com/Anthonyy232/Qwen3-ASR.git",
     "torch",
+    "hf-xet",
 ]
 dev = [
     "pytest",

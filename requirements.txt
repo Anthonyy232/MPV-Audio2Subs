@@ -4,4 +4,5 @@ numpy
 portalocker
 
 # ASR dependencies (Qwen3)
-qwen-asr @ git+https://github.com/Anthonyy232/Qwen3-ASR.git
+qwen-asr @ git+https://github.com/Anthonyy232/Qwen3-ASR.git
+hf-xet
