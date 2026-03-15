@@ -7,42 +7,41 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
+def _resolve_device(device: Literal["cuda", "cpu", "auto"]) -> str:
+    """Resolve 'auto' to the actual available device."""
+    if device == "auto":
+        try:
+            import torch
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            return "cpu"
+    return device
+
+
 @dataclass
 class TranscriptionConfig:
     """Configuration for the ASR transcription backend."""
-    
+
     model_name: str = "Qwen/Qwen3-ASR-1.7B"
     device: Literal["cuda", "cpu", "auto"] = "auto"
-    
+
     def get_device(self) -> str:
         """Resolve 'auto' to the actual device."""
-        if self.device == "auto":
-            try:
-                import torch
-                return "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                return "cpu"
-        return self.device
+        return _resolve_device(self.device)
 
 
 @dataclass
 class RefinementConfig:
     """Configuration for LLM-based subtitle refinement."""
-    
+
     enabled: bool = False
     model_name: str = "Qwen/Qwen3-0.6B"
     device: Literal["cuda", "cpu", "auto"] = "auto"
     enable_thinking: bool = False  # Default to False for speed, True for better reasoning
-    
+
     def get_device(self) -> str:
         """Resolve 'auto' to the actual device."""
-        if self.device == "auto":
-            try:
-                import torch
-                return "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
-                return "cpu"
-        return self.device
+        return _resolve_device(self.device)
 
 
 @dataclass
