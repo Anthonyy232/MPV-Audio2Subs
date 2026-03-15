@@ -76,16 +76,29 @@ def test_refine_batch_mismatch_fallback(mock_transformers):
     config = RefinementConfig(enabled=True, device="cpu")
     refiner = QwenRefiner(config)
     refiner.load()
-    
+
     # Mock LLM returning different number of lines
     tokenizer.decode.return_value = "Single line"
-    
+
     results = refiner.refine_batch(["line 1", "line 2"])
-    
+
     # Should fallback or at least not crash
     assert len(results) == 2
     assert results[0] == "Single line"
     assert results[1] == "line 2" # Original fallback for second line
+
+def test_refine_batch_trailing_newline(mock_transformers):
+    """LLM output with trailing newline should not trigger mismatch fallback."""
+    tokenizer, model = mock_transformers
+    config = RefinementConfig(enabled=True, device="cpu")
+    refiner = QwenRefiner(config)
+    refiner.load()
+
+    tokenizer.decode.return_value = "Line 1\nLine 2\n"
+    results = refiner.refine_batch(["line 1", "line 2"])
+    assert len(results) == 2
+    assert results[0] == "Line 1"
+    assert results[1] == "Line 2"
 
 def test_refinement_env_vars():
     env = {

@@ -96,9 +96,10 @@ class QwenRefiner:
         full_text = "\n".join(texts)
         
         refined_full = self.refine_text(full_text)
-        
-        # Split back - attempt to match line count
-        refined_lines = refined_full.split("\n")
+
+        # Split back - strip trailing whitespace first to avoid spurious empty lines
+        # from a model that appends a trailing newline
+        refined_lines = refined_full.strip().split("\n")
         
         # If the LLM changed the line count, we have a mapping problem.
         # For now, let's try to keep it simple: one prompt per meaningful block.
