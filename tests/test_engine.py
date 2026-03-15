@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import MagicMock
 from audio2subs.engine import TranscriptionEngine
-from audio2subs.config import ServiceConfig, TranscriptionConfig, SubtitleConfig
+from audio2subs.config import ServiceConfig, TranscriptionConfig, SubtitleConfig, RefinementConfig
 
 def test_engine_clear_queue():
     eng = TranscriptionEngine(
@@ -18,8 +18,18 @@ def test_engine_clear_queue():
     eng._task_queue.put((TranscriptionEngine.IDLE_PRIORITY_OFFSET + 1, (3.0, 4.0, 3)))
     
     eng._clear_queue()
-    
+
     assert eng._task_queue.qsize() == 2
     p1, t1 = eng._task_queue.get()
     assert p1 == TranscriptionEngine.IDLE_PRIORITY_OFFSET
     assert t1[0] == 2.0
+
+def test_engine_refiner_disabled():
+    config = ServiceConfig(refinement=RefinementConfig(enabled=False))
+    eng = TranscriptionEngine(video_path="dummy.mp4", duration=10.0, transcriber=MagicMock(), config=config)
+    assert eng._refiner is None
+
+def test_engine_refiner_enabled():
+    config = ServiceConfig(refinement=RefinementConfig(enabled=True, device="cpu"))
+    eng = TranscriptionEngine(video_path="dummy.mp4", duration=10.0, transcriber=MagicMock(), config=config)
+    assert eng._refiner is not None
