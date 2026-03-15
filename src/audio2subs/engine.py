@@ -14,6 +14,7 @@ from audio2subs.audio import AudioExtractor
 from audio2subs.config import ServiceConfig
 from audio2subs.subtitle import SubtitleWriter, SubtitleSegment, generate_subtitle_path
 from audio2subs.transcription.base import BaseTranscriber, TranscriptionResult
+from audio2subs.refinement import QwenRefiner
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,11 @@ class TranscriptionEngine:
             video_height,
             on_update=on_subtitle_update
         )
+        
+        # Refinement logic
+        self._refiner: QwenRefiner | None = None
+        if config.refinement.enabled:
+            self._refiner = QwenRefiner(config.refinement)
         
         # Threading state
         self._stop_event = threading.Event()
@@ -254,6 +260,31 @@ class TranscriptionEngine:
                 logger.error(f"{self._log_prefix} Worker loop error: {e}", exc_info=True)
                 time.sleep(1.0)
         
+        # Post-transcription refinement
+        if not self._stop_event.is_set() and self._refiner:
+            try:
+                logger.info(f"{self._log_prefix} Starting subtitle refinement...")
+                
+                # UNLOAD ASR model first to free VRAM
+                logger.info(f"{self._log_prefix} Unloading ASR model to free VRAM for refinement...")
+                self.transcriber.close()
+                
+                # Load Refiner
+                self._refiner.load()
+                
+                # Perform refinement
+                count = self._subtitle_writer.refine(self._refiner)
+                
+                if count > 0:
+                    logger.info(f"{self._log_prefix} Refinement complete: {count} segments polished")
+                    self._rewrite_needed.set()
+                
+                # Unload Refiner
+                self._refiner.close()
+                
+            except Exception as e:
+                logger.error(f"{self._log_prefix} Refinement failed: {e}", exc_info=True)
+
         if not self._stop_event.is_set():
             logger.info(f"{self._log_prefix} All {len(self._processed_chunks)} chunks processed")
             self._finished_event.set()

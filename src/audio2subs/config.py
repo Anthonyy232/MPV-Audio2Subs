@@ -26,6 +26,26 @@ class TranscriptionConfig:
 
 
 @dataclass
+class RefinementConfig:
+    """Configuration for LLM-based subtitle refinement."""
+    
+    enabled: bool = False
+    model_name: str = "Qwen/Qwen3-0.6B"
+    device: Literal["cuda", "cpu", "auto"] = "auto"
+    enable_thinking: bool = False  # Default to False for speed, True for better reasoning
+    
+    def get_device(self) -> str:
+        """Resolve 'auto' to the actual device."""
+        if self.device == "auto":
+            try:
+                import torch
+                return "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                return "cpu"
+        return self.device
+
+
+@dataclass
 class SubtitleConfig:
     """Configuration for subtitle generation and styling."""
     
@@ -71,6 +91,7 @@ class ServiceConfig:
     
     # Nested configs
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
+    refinement: RefinementConfig = field(default_factory=RefinementConfig)
     subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
     
     @classmethod

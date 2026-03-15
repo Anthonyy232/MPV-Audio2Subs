@@ -7,10 +7,13 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from audio2subs.config import SubtitleConfig
 from audio2subs.transcription.base import WordTimestamp
+
+if TYPE_CHECKING:
+    from audio2subs.refinement import QwenRefiner
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +149,44 @@ class SubtitleWriter:
                 self._segments.sort()
         
         return added
+
+    def refine(self, refiner: QwenRefiner) -> int:
+        """Refine all subtitle segments using an LLM.
+
+        Args:
+            refiner: The QwenRefiner instance to use
+
+        Returns:
+            Number of segments refined
+        """
+        with self._lock:
+            if not self._segments:
+                return 0
+
+            logger.info(f"Refining {len(self._segments)} subtitle segments...")
+            
+            # Batch segments to avoid hitting LLM context limits too hard, 
+            # and to allow some incremental progress/error handling.
+            batch_size = 50 
+            refined_count = 0
+            
+            for i in range(0, len(self._segments), batch_size):
+                batch = self._segments[i : i + batch_size]
+                texts = [s.text for s in batch]
+                
+                try:
+                    refined_texts = refiner.refine_batch(texts)
+                    
+                    # Update segments
+                    for j, refined_text in enumerate(refined_texts):
+                        if j < len(batch):
+                            batch[j].text = refined_text
+                            refined_count += 1
+                except Exception as e:
+                    logger.error(f"Failed to refine batch starting at {i}: {e}")
+                    # Continue with next batch
+
+            return refined_count
     
     def _words_to_segments(
         self,
