@@ -105,3 +105,21 @@ def test_refinement_env_vars_defaults():
     assert config.refinement.enabled is False
     assert config.refinement.model_name == "Qwen/Qwen3-0.6B"
     assert config.refinement.enable_thinking is False
+
+def test_refiner_close(mock_transformers):
+    config = RefinementConfig(enabled=True, device="cpu")
+    refiner = QwenRefiner(config)
+    refiner.load()
+    assert refiner.is_loaded
+
+    refiner.close()
+    assert not refiner.is_loaded
+    assert refiner._model is None
+    assert refiner._tokenizer is None
+
+def test_refiner_close_unloaded():
+    """close() on an unloaded refiner should be a no-op."""
+    config = RefinementConfig(enabled=True, device="cpu")
+    refiner = QwenRefiner(config)
+    refiner.close()  # Should not raise
+    assert not refiner.is_loaded
