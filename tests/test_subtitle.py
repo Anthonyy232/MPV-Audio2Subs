@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import MagicMock
 from audio2subs.config import SubtitleConfig
 from audio2subs.subtitle import SubtitleSegment, SubtitleWriter
 from audio2subs.transcription.base import WordTimestamp
@@ -33,3 +34,27 @@ def test_writer_duplicate_rejection(tmp_path):
     ])
     assert added == 2
     assert w.segment_count == 2
+
+def test_writer_refine(tmp_path):
+    w = SubtitleWriter(str(tmp_path / "out.ass"), SubtitleConfig())
+    w.add_segments([
+        SubtitleSegment(1.0, 2.0, "hello world"),
+        SubtitleSegment(3.0, 4.0, "how are you"),
+    ])
+
+    mock_refiner = MagicMock()
+    mock_refiner.refine_batch.return_value = ["Hello world.", "How are you?"]
+
+    count = w.refine(mock_refiner)
+
+    assert count == 2
+    assert w._segments[0].text == "Hello world."
+    assert w._segments[1].text == "How are you?"
+    mock_refiner.refine_batch.assert_called_once_with(["hello world", "how are you"])
+
+def test_writer_refine_empty(tmp_path):
+    w = SubtitleWriter(str(tmp_path / "out.ass"), SubtitleConfig())
+    mock_refiner = MagicMock()
+    count = w.refine(mock_refiner)
+    assert count == 0
+    mock_refiner.refine_batch.assert_not_called()
