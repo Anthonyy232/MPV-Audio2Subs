@@ -112,7 +112,13 @@ class ServiceConfig:
             config.persistent_mode = True
         if os.environ.get("AUDIO2SUBS_CPU_ONLY", "").lower() in ("1", "true"):
             config.transcription.device = "cpu"
-            
+        if os.environ.get("AUDIO2SUBS_REFINEMENT_ENABLED", "").lower() in ("1", "true"):
+            config.refinement.enabled = True
+        if refine_model := os.environ.get("AUDIO2SUBS_REFINEMENT_MODEL"):
+            config.refinement.model_name = refine_model
+        if os.environ.get("AUDIO2SUBS_REFINEMENT_THINKING", "").lower() in ("1", "true"):
+            config.refinement.enable_thinking = True
+
         return config
     
     def __repr__(self) -> str:

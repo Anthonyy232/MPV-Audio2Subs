@@ -1,6 +1,7 @@
+import os
 import pytest
 from unittest.mock import MagicMock, patch
-from audio2subs.config import RefinementConfig
+from audio2subs.config import RefinementConfig, ServiceConfig
 from audio2subs.refinement import QwenRefiner
 
 @pytest.fixture
@@ -85,3 +86,22 @@ def test_refine_batch_mismatch_fallback(mock_transformers):
     assert len(results) == 2
     assert results[0] == "Single line"
     assert results[1] == "line 2" # Original fallback for second line
+
+def test_refinement_env_vars():
+    env = {
+        "AUDIO2SUBS_REFINEMENT_ENABLED": "1",
+        "AUDIO2SUBS_REFINEMENT_MODEL": "Qwen/Qwen3-1.7B",
+        "AUDIO2SUBS_REFINEMENT_THINKING": "true",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        config = ServiceConfig.from_env()
+    assert config.refinement.enabled is True
+    assert config.refinement.model_name == "Qwen/Qwen3-1.7B"
+    assert config.refinement.enable_thinking is True
+
+def test_refinement_env_vars_defaults():
+    with patch.dict(os.environ, {}, clear=False):
+        config = ServiceConfig.from_env()
+    assert config.refinement.enabled is False
+    assert config.refinement.model_name == "Qwen/Qwen3-0.6B"
+    assert config.refinement.enable_thinking is False
