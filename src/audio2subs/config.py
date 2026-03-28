@@ -22,8 +22,9 @@ def _resolve_device(device: Literal["cuda", "cpu", "auto"]) -> str:
 class TranscriptionConfig:
     """Configuration for the ASR transcription backend."""
 
-    model_name: str = "Qwen/Qwen3-ASR-1.7B"
+    model_name: str = "CohereLabs/cohere-transcribe-03-2026"
     device: Literal["cuda", "cpu", "auto"] = "auto"
+    language: str = "en"  # ISO-639-1 language code (e.g. 'en', 'fr', 'de')
 
     def get_device(self) -> str:
         """Resolve 'auto' to the actual device."""

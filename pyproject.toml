@@ -12,7 +12,7 @@ license = {text = "MIT"}
 authors = [
     {name = "Anthonyy232"}
 ]
-keywords = ["mpv", "subtitles", "asr", "speech-recognition", "qwen", "qwen3-asr"]
+keywords = ["mpv", "subtitles", "asr", "speech-recognition", "cohere", "cohere-transcribe", "stable-ts"]
 
 dependencies = [
     "python-mpv-jsonipc",
@@ -22,9 +22,17 @@ dependencies = [
 
 [project.optional-dependencies]
 asr = [
-    "qwen-asr @ git+https://github.com/Anthonyy232/Qwen3-ASR.git",
+    "transformers>=5.4.0",
     "torch",
-    "hf-xet",
+    "soundfile",
+    "librosa",
+    "sentencepiece",
+    "protobuf",
+    "stable-ts",
+]
+asr-fast = [
+    "audio2subs[asr]",
+    "hf-xet",  # faster HuggingFace downloads via Xet storage
 ]
 dev = [
     "pytest",
@@ -42,7 +50,7 @@ where = ["src"]
 "" = "src"
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.9"
 warn_return_any = true
 warn_unused_ignores = true
 disallow_untyped_defs = true

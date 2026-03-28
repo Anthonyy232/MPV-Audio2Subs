@@ -3,6 +3,11 @@ python-mpv-jsonipc
 numpy
 portalocker
 
-# ASR dependencies (Qwen3)
-qwen-asr @ git+https://github.com/Anthonyy232/Qwen3-ASR.git
-hf-xet
+# ASR dependencies — install with: pip install -e ".[asr]"
+# transformers>=5.4.0
+# torch
+# soundfile
+# librosa
+# sentencepiece
+# protobuf
+# stable-ts

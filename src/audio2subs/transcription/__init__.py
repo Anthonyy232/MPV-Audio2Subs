@@ -5,11 +5,11 @@ from audio2subs.transcription.base import (
     WordTimestamp,
     BaseTranscriber,
 )
-from audio2subs.transcription.qwen import QwenTranscriber
+from audio2subs.transcription.cohere import CohereTranscriber
 
 __all__ = [
     "TranscriptionResult",
     "WordTimestamp",
     "BaseTranscriber",
-    "QwenTranscriber",
+    "CohereTranscriber",
 ]

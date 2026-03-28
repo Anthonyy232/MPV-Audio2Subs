@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from audio2subs.config import ServiceConfig
 from audio2subs.engine import TranscriptionEngine
 from audio2subs.mpv_client import MPVClient
-from audio2subs.transcription import QwenTranscriber
+from audio2subs.transcription import CohereTranscriber
 
 if TYPE_CHECKING:
     from audio2subs.transcription.base import BaseTranscriber
@@ -52,7 +52,7 @@ class SubtitleService:
         
         # Initialize transcriber instance immediately so engines can be created
         if not self._transcriber:
-            self._transcriber = QwenTranscriber(self.config.transcription)
+            self._transcriber = CohereTranscriber(self.config.transcription)
             
         # Connect to MPV
         self._mpv = MPVClient(self.config.socket_path)
@@ -132,7 +132,7 @@ class SubtitleService:
         
         try:
             if not self._transcriber:
-                self._transcriber = QwenTranscriber(self.config.transcription)
+                self._transcriber = CohereTranscriber(self.config.transcription)
             self._transcriber.load()
             self._model_loaded.set()
             logger.info("Model loaded successfully")
