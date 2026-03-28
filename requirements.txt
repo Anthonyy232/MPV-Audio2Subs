@@ -12,3 +12,4 @@ portalocker
 # sentencepiece
 # protobuf
 # stable-ts
+# silero-vad

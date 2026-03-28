@@ -153,8 +153,6 @@ class SubtitleService:
         self._mpv.bind_event('shutdown', self._on_shutdown)
         self._mpv.bind_event('client-message', self._on_message)
         self._mpv.observe_property('path', self._on_path_change)
-        self._mpv.observe_property('time-pos', self._on_time_pos)
-        self._mpv.observe_property('pause', self._on_pause)
         self._mpv.observe_property('sid', self._on_sid_change)
     
     def _on_path_change(self, _: str | None, path: str | None) -> None:
@@ -221,25 +219,6 @@ class SubtitleService:
             on_subtitle_update=self._on_subtitle_update,
             on_progress=self._on_progress,
         )
-    
-    def _on_time_pos(self, _: str | None, time_pos: float | None) -> None:
-        """Handle playback position change."""
-        if not self._current_engine or time_pos is None:
-            return
-        if self._current_engine.is_finished:
-            return
-        if self._mpv and not self._mpv.pause:
-            self._current_engine.process_time_update(time_pos)
-    
-    def _on_pause(self, _: str | None, is_paused: bool) -> None:
-        """Handle pause/resume."""
-        if not self._current_engine or self._current_engine.is_finished:
-            return
-        
-        if not is_paused and self._mpv:
-            time_pos = self._mpv.time_pos
-            if time_pos is not None:
-                self._current_engine.process_time_update(time_pos)
     
     def _on_sid_change(self, _: str | None, sid: int | str | None) -> None:
         """Handle subtitle track change - detect user deselection."""

@@ -30,6 +30,7 @@ asr = [
     "sentencepiece",
     "protobuf",
     "stable-ts",
+    "silero-vad",
 ]
 asr-fast = [
     "audio2subs[asr]",

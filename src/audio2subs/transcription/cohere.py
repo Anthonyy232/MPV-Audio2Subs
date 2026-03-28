@@ -20,10 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 class CohereTranscriber(BaseTranscriber):
-    """Two-stage transcriber: Cohere Transcribe for ASR, stable-ts for word alignment.
+    """Three-stage transcriber: Silero VAD → Cohere ASR → stable-ts alignment.
 
-    Stage 1: CohereAsrForConditionalGeneration produces plain text from audio.
-    Stage 2: stable-ts model.align() maps that text back to the audio for
+    Stage 1: Silero VAD zeros out non-speech regions to prevent hallucinations.
+    Stage 2: CohereAsrForConditionalGeneration produces plain text from audio.
+    Stage 3: stable-ts model.align() maps that text back to the audio for
              precise word-level timestamps.
     """
 
@@ -38,6 +39,7 @@ class CohereTranscriber(BaseTranscriber):
         self._processor: Any = None
         self._model: Any = None         # CohereAsrForConditionalGeneration
         self._aligner: Any = None       # stable-ts Whisper model (tiny)
+        self._vad: Any = None           # Silero VAD model
 
     # ------------------------------------------------------------------
     # Model loading
@@ -96,6 +98,11 @@ class CohereTranscriber(BaseTranscriber):
             logger.info("Loading stable-ts aligner (tiny) on cpu")
             self._aligner = stable_whisper.load_model("tiny", device="cpu")
 
+            # --- Stage 3: Silero VAD (CPU, ~2MB, prevents hallucinations on silence) ---
+            logger.info("Loading Silero VAD")
+            from silero_vad import load_silero_vad
+            self._vad = load_silero_vad()
+
             self._is_loaded = True
             self._loaded_event.set()
             logger.info("Cohere + stable-ts models loaded successfully")
@@ -106,6 +113,7 @@ class CohereTranscriber(BaseTranscriber):
             self._model = None
             self._processor = None
             self._aligner = None
+            self._vad = None
             if not isinstance(e, TranscriptionError):
                 raise TranscriptionError(f"Failed to load Cohere model: {e}") from e
             raise
@@ -165,6 +173,39 @@ class CohereTranscriber(BaseTranscriber):
         arr = np.frombuffer(audio_buffer, dtype=np.int16)
         return arr.astype(np.float32) / 32768.0
 
+    def _apply_vad(self, audio_float: np.ndarray) -> np.ndarray:
+        """Zero out non-speech regions using Silero VAD.
+
+        Preserves original timestamps by zeroing silence rather than removing
+        it, preventing Cohere from hallucinating on background noise.
+        """
+        from silero_vad import get_speech_timestamps
+
+        speech_timestamps = get_speech_timestamps(
+            audio_float,
+            self._vad,
+            sampling_rate=SAMPLE_RATE,
+            threshold=0.5,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=500,
+            speech_pad_ms=100,
+        )
+
+        if not speech_timestamps:
+            logger.debug("VAD: no speech detected")
+            return np.zeros_like(audio_float)
+
+        speech_s = sum(ts["end"] - ts["start"] for ts in speech_timestamps) / SAMPLE_RATE
+        logger.debug(
+            f"VAD: {len(speech_timestamps)} segments, "
+            f"{speech_s:.1f}s / {len(audio_float) / SAMPLE_RATE:.1f}s speech"
+        )
+
+        mask = np.zeros(len(audio_float), dtype=np.float32)
+        for ts in speech_timestamps:
+            mask[ts["start"]:ts["end"]] = 1.0
+        return audio_float * mask
+
     def _run_cohere(self, audio_float: np.ndarray) -> str:
         """Run Cohere ASR on a float32 waveform and return plain text.
 
@@ -181,6 +222,10 @@ class CohereTranscriber(BaseTranscriber):
         import torch
 
         language = self.config.language
+
+        # Suppress hallucinations on silence/noise before passing to Cohere
+        if self._vad is not None:
+            audio_float = self._apply_vad(audio_float)
 
         # Processor splits long audio automatically; audio_chunk_index encodes
         # chunk boundaries needed by decode() for reassembly.
@@ -261,22 +306,6 @@ class CohereTranscriber(BaseTranscriber):
 
         return words
 
-    def transcribe_batch(self, audio_buffers: list[bytes]) -> list[TranscriptionResult]:
-        """Transcribe multiple audio buffers sequentially.
-
-        Cohere Transcribe handles long-form audio chunking internally, so we
-        delegate to transcribe() per-item rather than batching manually.
-
-        Args:
-            audio_buffers: List of raw PCM bytes (16 kHz, mono, 16-bit).
-
-        Returns:
-            List of TranscriptionResult, one per buffer, in the same order.
-        """
-        if not self._is_loaded or self._model is None:
-            raise TranscriptionError("Cohere model is not loaded")
-        return [self.transcribe(buf) for buf in audio_buffers]
-
     # ------------------------------------------------------------------
     # Resource management
     # ------------------------------------------------------------------
@@ -304,6 +333,10 @@ class CohereTranscriber(BaseTranscriber):
             logger.info("Releasing stable-ts aligner from memory")
             del self._aligner
             self._aligner = None
+
+        if self._vad is not None:
+            del self._vad
+            self._vad = None
 
         if _has_torch:
             import torch

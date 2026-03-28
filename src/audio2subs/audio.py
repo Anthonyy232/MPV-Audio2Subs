@@ -37,6 +37,8 @@ class AudioExtractor:
         
         self._temp_file_path: str | None = None
         self._file_handle: BinaryIO | None = None
+        self._ffmpeg_process: subprocess.Popen | None = None
+        self._closed = False
         self._extraction_complete = threading.Event()
         self._extraction_thread: threading.Thread | None = None
         self._extraction_error: Exception | None = None
@@ -105,7 +107,8 @@ class AudioExtractor:
         except Exception as e:
             with self._lock:
                 self._extraction_error = e
-            logger.error(f"Streaming extraction failed for {os.path.basename(self.video_path)}: {e}")
+            if not self._closed:
+                logger.error(f"Streaming extraction failed for {os.path.basename(self.video_path)}: {e}")
         finally:
             self._extraction_complete.set()
             with self._data_cv:
@@ -156,6 +159,7 @@ class AudioExtractor:
                 stderr=subprocess.PIPE,
                 creationflags=creationflags
             )
+            self._ffmpeg_process = process
             
             try:
                 # Monitor progress
@@ -284,8 +288,29 @@ class AudioExtractor:
             logger.error(f"Failed to read audio chunk: {e}")
             return None
     
+    def read_all(self) -> bytes | None:
+        """Read the entire extracted audio as raw PCM bytes.
+
+        Must be called after extraction is complete.
+        """
+        fh = self._file_handle  # snapshot to avoid race with close()
+        if fh is None:
+            return None
+        try:
+            fh.seek(0)
+            return fh.read()
+        except (IOError, ValueError) as e:
+            logger.error(f"Failed to read audio: {e}")
+            return None
+
     def close(self) -> None:
         """Release all resources."""
+        self._closed = True
+
+        if self._ffmpeg_process is not None and self._ffmpeg_process.poll() is None:
+            self._ffmpeg_process.kill()
+            self._ffmpeg_process = None
+
         if self._file_handle:
             try:
                 self._file_handle.close()

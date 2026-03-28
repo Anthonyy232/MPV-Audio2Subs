@@ -72,18 +72,12 @@ class SubtitleConfig:
 class ServiceConfig:
     """Main service configuration."""
     
-    # Chunking
-    chunk_duration_seconds: int = 30
-    
     # MPV socket path (works on both Linux/macOS and Windows)
     socket_path: str = "/tmp/mpv-socket"
     
     # Service behavior
     persistent_mode: bool = False  # Keep model in memory when toggled off
     auto_select_subtitle: bool = True  # Auto-select AI subs on first generation
-    
-    # Subtitle rewrite throttling
-    rewrite_throttle_seconds: float = 1.0
     
     # Logging
     log_level: str = "INFO"
@@ -101,13 +95,6 @@ class ServiceConfig:
         
         if socket := os.environ.get("MPV_SOCKET"):
             config.socket_path = socket
-        if chunk_dur := os.environ.get("AUDIO2SUBS_CHUNK_DURATION"):
-            try:
-                value = int(chunk_dur)
-                if value > 0:
-                    config.chunk_duration_seconds = value
-            except ValueError:
-                pass  # Ignore invalid values
         if os.environ.get("AUDIO2SUBS_PERSISTENT_MODE", "").lower() in ("1", "true"):
             config.persistent_mode = True
         if os.environ.get("AUDIO2SUBS_CPU_ONLY", "").lower() in ("1", "true"):
@@ -124,6 +111,5 @@ class ServiceConfig:
     def __repr__(self) -> str:
         return (
             f"ServiceConfig(socket={self.socket_path!r}, "
-            f"chunk_duration={self.chunk_duration_seconds}s, "
             f"device={self.transcription.device!r})"
         )
