@@ -8,6 +8,7 @@ import re
 from typing import Callable
 
 from audio2subs.config import SubtitleConfig
+from audio2subs.utils.performance import Timer
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +53,10 @@ class SubtitleWriter:
 
         temp_path = self.output_path + ".tmp"
         try:
-            with open(temp_path, "w", encoding="utf-8") as f:
-                f.write(ass_content)
-            os.replace(temp_path, self.output_path)
+            with Timer("Atomic Subtitle Write to disk", logger):
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    f.write(ass_content)
+                os.replace(temp_path, self.output_path)
 
             if self.on_update:
                 self.on_update(self.output_path)

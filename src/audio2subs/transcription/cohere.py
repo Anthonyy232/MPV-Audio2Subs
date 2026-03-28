@@ -149,8 +149,9 @@ class CohereTranscriber(BaseTranscriber):
     # ------------------------------------------------------------------
 
     def _pcm_to_float(self, audio_buffer: bytes) -> np.ndarray:
-        arr = np.frombuffer(audio_buffer, dtype=np.int16)
-        return arr.astype(np.float32) / 32768.0
+        with Timer("PCM -> Float conversion", logger):
+            arr = np.frombuffer(audio_buffer, dtype=np.int16)
+            return arr.astype(np.float32) / 32768.0
 
     def _apply_vad(self, audio_float: np.ndarray) -> np.ndarray:
         """Zero out non-speech regions using Silero VAD."""
@@ -171,16 +172,17 @@ class CohereTranscriber(BaseTranscriber):
             logger.debug("VAD: no speech detected")
             return np.zeros_like(audio_float)
 
-        speech_s = sum(ts["end"] - ts["start"] for ts in speech_timestamps) / SAMPLE_RATE
-        logger.debug(
-            f"VAD: {len(speech_timestamps)} segments, "
-            f"{speech_s:.1f}s / {len(audio_float) / SAMPLE_RATE:.1f}s speech"
-        )
+        with Timer("VAD Masking", logger):
+            speech_s = sum(ts["end"] - ts["start"] for ts in speech_timestamps) / SAMPLE_RATE
+            logger.debug(
+                f"VAD: {len(speech_timestamps)} segments, "
+                f"{speech_s:.1f}s / {len(audio_float) / SAMPLE_RATE:.1f}s speech"
+            )
 
-        mask = np.zeros(len(audio_float), dtype=np.float32)
-        for ts in speech_timestamps:
-            mask[ts["start"]:ts["end"]] = 1.0
-        return audio_float * mask
+            mask = np.zeros(len(audio_float), dtype=np.float32)
+            for ts in speech_timestamps:
+                mask[ts["start"]:ts["end"]] = 1.0
+            return audio_float * mask
 
     def _run_cohere(self, audio_float: np.ndarray) -> str:
         """Run Cohere ASR on a float32 waveform and return plain text."""
@@ -191,31 +193,37 @@ class CohereTranscriber(BaseTranscriber):
         if self._vad is not None:
             audio_float = self._apply_vad(audio_float)
 
-        inputs = self._processor(
-            audio=audio_float,
-            sampling_rate=SAMPLE_RATE,
-            return_tensors="pt",
-            language=language,
-        )
-
-        audio_chunk_index = inputs.get("audio_chunk_index")
-        inputs = inputs.to(self._model.device, dtype=self._model.dtype)
-
         duration = len(audio_float) / SAMPLE_RATE
-        with Timer("Cohere ASR Inference", logger, duration=duration):
-            with torch.inference_mode():
-                output_ids = self._model.generate(**inputs, max_new_tokens=256)
-
-            if audio_chunk_index is not None:
-                result = self._processor.decode(
-                    output_ids,
-                    skip_special_tokens=True,
-                    audio_chunk_index=audio_chunk_index,
+        with Timer("Cohere ASR (Full)", logger, duration=duration):
+            with Timer("ASR Preprocessing (Processor)", logger):
+                inputs = self._processor(
+                    audio=audio_float,
+                    sampling_rate=SAMPLE_RATE,
+                    return_tensors="pt",
                     language=language,
                 )
-                text = result[0] if isinstance(result, list) else result
-            else:
-                text = self._processor.decode(output_ids, skip_special_tokens=True)
+                audio_chunk_index = inputs.get("audio_chunk_index")
+
+            with Timer("ASR Data Move (Host -> Device)", logger):
+                inputs = inputs.to(self._model.device, dtype=self._model.dtype)
+
+            with Timer("ASR Generation (Inference)", logger):
+                with torch.inference_mode():
+                    output_ids = self._model.generate(**inputs, max_new_tokens=256)
+
+            with Timer("ASR Decoding (IDs -> Text)", logger):
+                if audio_chunk_index is not None:
+                    result = self._processor.decode(
+                        output_ids,
+                        skip_special_tokens=True,
+                        audio_chunk_index=audio_chunk_index,
+                        language=language,
+                    )
+                    text = result[0] if isinstance(result, list) else result
+                else:
+                    text = self._processor.decode(output_ids, skip_special_tokens=True)
+
+        return text.strip()
 
         return text.strip()
 
@@ -260,32 +268,34 @@ class CohereTranscriber(BaseTranscriber):
 
         # --- Post-processing ---
         try:
-            result.remove_repetition(4, verbose=False)
-            result.adjust_gaps()
-            result.regroup()
+            with Timer("stable-ts post-processing", logger):
+                result.remove_repetition(4, verbose=False)
+                result.adjust_gaps()
+                result.regroup()
         except Exception as e:
             logger.warning(f"stable-ts post-processing failed: {e}")
 
         # --- Generate ASS content ---
         cfg = self.subtitle_config
-        ass_content = result.to_ass(
-            segment_level=True,
-            word_level=False,
-            font=cfg.font_name,
-            font_size=cfg.font_size,
-            PrimaryColour=cfg.primary_color,
-            SecondaryColour="&H000000FF",
-            OutlineColour=cfg.outline_color,
-            BackColour="&H00000000",
-            BorderStyle=1,
-            Outline=2,
-            Shadow=2,
-            Alignment=2,
-            MarginL=10,
-            MarginR=10,
-            MarginV=10,
-            Encoding=1,
-        )
+        with Timer("stable-ts ASS Formatting (to_ass)", logger):
+            ass_content = result.to_ass(
+                segment_level=True,
+                word_level=False,
+                font=cfg.font_name,
+                font_size=cfg.font_size,
+                PrimaryColour=cfg.primary_color,
+                SecondaryColour="&H000000FF",
+                OutlineColour=cfg.outline_color,
+                BackColour="&H00000000",
+                BorderStyle=1,
+                Outline=2,
+                Shadow=2,
+                Alignment=2,
+                MarginL=10,
+                MarginR=10,
+                MarginV=10,
+                Encoding=1,
+            )
 
         return ass_content or ""
 

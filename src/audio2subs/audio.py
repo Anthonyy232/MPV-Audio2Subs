@@ -62,8 +62,9 @@ class AudioExtractor:
         if fh is None:
             return None
         try:
-            fh.seek(0)
-            return fh.read()
+            with Timer("Read extracted audio from disk", logger):
+                fh.seek(0)
+                return fh.read()
         except (IOError, ValueError) as e:
             logger.error(f"Failed to read audio: {e}")
             return None
