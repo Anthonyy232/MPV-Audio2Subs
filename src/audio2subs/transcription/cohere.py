@@ -1,4 +1,4 @@
-"""Cohere Transcribe + stable-ts forced alignment backend."""
+"""Cohere Transcribe + stable-ts pipeline backend."""
 
 from __future__ import annotations
 
@@ -7,12 +7,11 @@ from typing import Any
 
 import numpy as np
 
-from audio2subs.config import TranscriptionConfig
+from audio2subs.config import TranscriptionConfig, SubtitleConfig
 from audio2subs.exceptions import TranscriptionError
 from audio2subs.transcription.base import (
     BaseTranscriber,
     TranscriptionResult,
-    WordTimestamp,
     SAMPLE_RATE,
 )
 
@@ -20,25 +19,25 @@ logger = logging.getLogger(__name__)
 
 
 class CohereTranscriber(BaseTranscriber):
-    """Three-stage transcriber: Silero VAD → Cohere ASR → stable-ts alignment.
+    """Cohere ASR with stable-ts post-processing pipeline.
 
-    Stage 1: Silero VAD zeros out non-speech regions to prevent hallucinations.
-    Stage 2: CohereAsrForConditionalGeneration produces plain text from audio.
-    Stage 3: stable-ts model.align() maps that text back to the audio for
-             precise word-level timestamps.
+    1. Silero VAD zeros out non-speech regions to prevent hallucinations.
+    2. CohereAsrForConditionalGeneration produces plain text from audio.
+    3. stable-ts align → refine → remove_repetition → adjust_gaps → regroup
+       produces timed subtitle segments and generates ASS output.
     """
 
-    def __init__(self, config: TranscriptionConfig):
-        """Initialise the Cohere transcriber.
-
-        Args:
-            config: Transcription configuration (model_name, device, language).
-        """
+    def __init__(
+        self,
+        config: TranscriptionConfig,
+        subtitle_config: SubtitleConfig | None = None,
+    ):
         super().__init__()
         self.config = config
+        self.subtitle_config = subtitle_config or SubtitleConfig()
         self._processor: Any = None
         self._model: Any = None         # CohereAsrForConditionalGeneration
-        self._aligner: Any = None       # stable-ts Whisper model (tiny)
+        self._aligner: Any = None       # stable-ts Whisper model (base.en)
         self._vad: Any = None           # Silero VAD model
 
     # ------------------------------------------------------------------
@@ -46,11 +45,6 @@ class CohereTranscriber(BaseTranscriber):
     # ------------------------------------------------------------------
 
     def load(self) -> None:
-        """Load both the Cohere ASR model and the stable-ts aligner.
-
-        Raises:
-            TranscriptionError: If loading fails.
-        """
         if self._is_loaded:
             return
 
@@ -66,7 +60,7 @@ class CohereTranscriber(BaseTranscriber):
                 msg = (
                     f"Missing dependency: {missing}. "
                     "Please run: pip install transformers>=5.4.0 torch soundfile librosa "
-                    "sentencepiece protobuf stable-ts"
+                    "sentencepiece protobuf stable-ts silero-vad"
                 )
                 logger.critical(msg)
                 self._loaded_event.set()
@@ -74,7 +68,6 @@ class CohereTranscriber(BaseTranscriber):
 
             device = self.config.get_device()
 
-            # Resolve dtype
             dtype = torch.float32
             if device == "cuda":
                 if torch.cuda.is_available():
@@ -85,7 +78,7 @@ class CohereTranscriber(BaseTranscriber):
                     logger.warning("CUDA requested but unavailable — falling back to CPU.")
                     device = "cpu"
 
-            # --- Stage 1: Cohere ASR ---
+            # --- Cohere ASR ---
             logger.info(f"Loading Cohere ASR on {device} ({dtype})")
             self._processor = AutoProcessor.from_pretrained(self.config.model_name)
             self._model = CohereAsrForConditionalGeneration.from_pretrained(
@@ -94,11 +87,11 @@ class CohereTranscriber(BaseTranscriber):
                 torch_dtype=dtype,
             )
 
-            # --- Stage 2: stable-ts aligner (tiny Whisper, CPU is fine) ---
-            logger.info("Loading stable-ts aligner (tiny) on cpu")
-            self._aligner = stable_whisper.load_model("tiny", device="cpu")
+            # --- stable-ts aligner (tiny Whisper, CPU) ---
+            logger.info("Loading stable-ts aligner (base.en) on cpu")
+            self._aligner = stable_whisper.load_model("base.en", device="cpu")
 
-            # --- Stage 3: Silero VAD (CPU, ~2MB, prevents hallucinations on silence) ---
+            # --- Silero VAD (CPU, ~2MB) ---
             logger.info("Loading Silero VAD")
             from silero_vad import load_silero_vad
             self._vad = load_silero_vad()
@@ -123,17 +116,6 @@ class CohereTranscriber(BaseTranscriber):
     # ------------------------------------------------------------------
 
     def transcribe(self, audio_buffer: bytes) -> TranscriptionResult:
-        """Transcribe raw PCM audio using Cohere ASR + stable-ts alignment.
-
-        Args:
-            audio_buffer: Raw PCM audio bytes (16 kHz, mono, 16-bit).
-
-        Returns:
-            TranscriptionResult with word-level timestamps.
-
-        Raises:
-            TranscriptionError: On failure.
-        """
         if not self._is_loaded or self._model is None:
             raise TranscriptionError("Cohere model is not loaded")
 
@@ -143,22 +125,16 @@ class CohereTranscriber(BaseTranscriber):
         try:
             audio_float = self._pcm_to_float(audio_buffer)
 
-            # Stage 1: Cohere ASR → plain text
+            # Cohere ASR → plain text (VAD applied internally)
             text = self._run_cohere(audio_float)
             if not text:
-                logger.debug("Cohere returned no text for chunk")
+                logger.debug("Cohere returned no text")
                 return TranscriptionResult()
 
-            # Stage 2: stable-ts forced alignment → word timestamps
-            words = self._run_alignment(audio_float, text)
+            # stable-ts pipeline → ASS subtitle content
+            ass_content = self._run_stable_ts(audio_float, text)
 
-            if not words:
-                logger.warning(
-                    f"stable-ts alignment returned no words for chunk "
-                    f"({len(audio_buffer)} bytes). Text was: {text[:80]!r}"
-                )
-
-            return TranscriptionResult(words=words, full_text=text.strip())
+            return TranscriptionResult(full_text=text.strip(), ass_content=ass_content)
 
         except Exception as e:
             logger.error(f"Cohere transcription failed: {e}", exc_info=True)
@@ -169,16 +145,11 @@ class CohereTranscriber(BaseTranscriber):
     # ------------------------------------------------------------------
 
     def _pcm_to_float(self, audio_buffer: bytes) -> np.ndarray:
-        """Convert raw 16-bit PCM bytes to float32 in [-1, 1]."""
         arr = np.frombuffer(audio_buffer, dtype=np.int16)
         return arr.astype(np.float32) / 32768.0
 
     def _apply_vad(self, audio_float: np.ndarray) -> np.ndarray:
-        """Zero out non-speech regions using Silero VAD.
-
-        Preserves original timestamps by zeroing silence rather than removing
-        it, preventing Cohere from hallucinating on background noise.
-        """
+        """Zero out non-speech regions using Silero VAD."""
         from silero_vad import get_speech_timestamps
 
         speech_timestamps = get_speech_timestamps(
@@ -207,28 +178,14 @@ class CohereTranscriber(BaseTranscriber):
         return audio_float * mask
 
     def _run_cohere(self, audio_float: np.ndarray) -> str:
-        """Run Cohere ASR on a float32 waveform and return plain text.
-
-        Follows the documented long-form pattern:
-          https://huggingface.co/CohereLabs/cohere-transcribe-03-2026
-
-        For audio longer than the feature extractor's max_audio_clip_s the
-        processor splits the waveform into chunks automatically.  The
-        audio_chunk_index tensor must be extracted *before* moving inputs
-        to the model device (it may not be a plain tensor on all builds),
-        kept in inputs so generate() can use it, and then passed to
-        processor.decode() so the per-chunk transcriptions are reassembled.
-        """
+        """Run Cohere ASR on a float32 waveform and return plain text."""
         import torch
 
         language = self.config.language
 
-        # Suppress hallucinations on silence/noise before passing to Cohere
         if self._vad is not None:
             audio_float = self._apply_vad(audio_float)
 
-        # Processor splits long audio automatically; audio_chunk_index encodes
-        # chunk boundaries needed by decode() for reassembly.
         inputs = self._processor(
             audio=audio_float,
             sampling_rate=SAMPLE_RATE,
@@ -236,19 +193,13 @@ class CohereTranscriber(BaseTranscriber):
             language=language,
         )
 
-        # Extract BEFORE .to() — it might not support the device/dtype cast.
         audio_chunk_index = inputs.get("audio_chunk_index")
-
-        # Move all tensors to model device + dtype (matches the model's precision).
         inputs = inputs.to(self._model.device, dtype=self._model.dtype)
 
         with torch.inference_mode():
-            # audio_chunk_index stays inside inputs so generate() sees it.
             output_ids = self._model.generate(**inputs, max_new_tokens=256)
 
         if audio_chunk_index is not None:
-            # Long-form path: decode() reassembles chunks and returns a list.
-            # Take [0] to get the first (and only) audio item's full transcript.
             result = self._processor.decode(
                 output_ids,
                 skip_special_tokens=True,
@@ -257,61 +208,79 @@ class CohereTranscriber(BaseTranscriber):
             )
             text = result[0] if isinstance(result, list) else result
         else:
-            # Short-form path: single output, decode directly.
             text = self._processor.decode(output_ids, skip_special_tokens=True)
 
         return text.strip()
 
-    def _run_alignment(self, audio_float: np.ndarray, text: str) -> list[WordTimestamp]:
-        """Use stable-ts model.align() to get word-level timestamps.
+    def _run_stable_ts(self, audio_float: np.ndarray, text: str) -> str:
+        """Run the full stable-ts pipeline and return ASS subtitle content.
 
-        Args:
-            audio_float: Float32 waveform at 16 kHz.
-            text: Plain text to align.
-
-        Returns:
-            List of WordTimestamp (empty if alignment fails).
+        Pipeline: align → refine → remove_repetition → adjust_gaps → regroup → to_ass.
+        Uses the original (non-VAD) audio for accurate alignment.
         """
         language = self.config.language
 
+        # --- Forced alignment ---
         try:
             result = self._aligner.align(
                 audio_float,
                 text,
                 language=language,
-                verbose=None,           # suppress progress output
-                regroup=False,          # we handle grouping ourselves in SubtitleWriter
-                remove_instant_words=True,  # drop zero-duration words
+                vad=True,
+                verbose=None,
+                regroup=False,
+                remove_instant_words=True,
+                aligner="new",
             )
         except Exception as e:
             logger.error(f"stable-ts align() failed: {e}", exc_info=True)
-            return []
+            return ""
 
         if result is None:
-            return []
+            return ""
 
-        words: list[WordTimestamp] = []
-        for segment in result.segments:
-            if not segment.words:
-                continue
-            for w in segment.words:
-                word_text = w.word.strip()
-                if not word_text:
-                    continue
-                words.append(WordTimestamp(
-                    word=word_text,
-                    start=float(w.start),
-                    end=float(w.end),
-                ))
+        # --- Refine timestamps (iterative muting for precise boundaries) ---
+        try:
+            self._aligner.refine(audio_float, result, verbose=None)
+        except Exception as e:
+            logger.warning(f"stable-ts refine() failed, using unrefined: {e}")
 
-        return words
+        # --- Post-processing ---
+        try:
+            result.remove_repetition(4, verbose=False)
+            result.adjust_gaps()
+            result.regroup()
+        except Exception as e:
+            logger.warning(f"stable-ts post-processing failed: {e}")
+
+        # --- Generate ASS content ---
+        cfg = self.subtitle_config
+        ass_content = result.to_ass(
+            segment_level=True,
+            word_level=False,
+            font=cfg.font_name,
+            font_size=cfg.font_size,
+            PrimaryColour=cfg.primary_color,
+            SecondaryColour="&H000000FF",
+            OutlineColour=cfg.outline_color,
+            BackColour="&H00000000",
+            BorderStyle=1,
+            Outline=2,
+            Shadow=2,
+            Alignment=2,
+            MarginL=10,
+            MarginR=10,
+            MarginV=10,
+            Encoding=1,
+        )
+
+        return ass_content or ""
 
     # ------------------------------------------------------------------
     # Resource management
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Release both models from memory."""
         super().close()
 
         try:

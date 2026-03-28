@@ -41,10 +41,6 @@ class SubtitleService:
         self._current_engine: TranscriptionEngine | None = None
         self._engines: dict[str, TranscriptionEngine] = {}
         
-        # Model loading state
-        self._model_loading = False
-        self._model_loaded = threading.Event()
-    
     def start(self) -> None:
         """Start the service and connect to MPV."""
         logger.info("Starting subtitle service")
@@ -52,7 +48,7 @@ class SubtitleService:
         
         # Initialize transcriber instance immediately so engines can be created
         if not self._transcriber:
-            self._transcriber = CohereTranscriber(self.config.transcription)
+            self._transcriber = CohereTranscriber(self.config.transcription, self.config.subtitle)
             
         # Connect to MPV
         self._mpv = MPVClient(self.config.socket_path)
@@ -128,13 +124,10 @@ class SubtitleService:
     def _load_model(self) -> None:
         """Load the transcription model."""
         logger.info("Loading transcription model...")
-        self._model_loading = True
-        
         try:
             if not self._transcriber:
-                self._transcriber = CohereTranscriber(self.config.transcription)
+                self._transcriber = CohereTranscriber(self.config.transcription, self.config.subtitle)
             self._transcriber.load()
-            self._model_loaded.set()
             logger.info("Model loaded successfully")
         except Exception as e:
             logger.critical(f"Failed to load model: {e}", exc_info=True)
@@ -142,8 +135,6 @@ class SubtitleService:
                 self._mpv.show_osd(f"AI Service Error: {e}", 10000)
                 self._mpv.send_message("ai-subs/error", str(e))
             raise
-        finally:
-            self._model_loading = False
     
     def _setup_observers(self) -> None:
         """Set up MPV event observers."""

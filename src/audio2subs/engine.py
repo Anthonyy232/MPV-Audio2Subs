@@ -12,7 +12,6 @@ from audio2subs.audio import AudioExtractor
 from audio2subs.config import ServiceConfig
 from audio2subs.subtitle import SubtitleWriter, generate_subtitle_path
 from audio2subs.transcription.base import BaseTranscriber
-from audio2subs.refinement import QwenRefiner
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +19,8 @@ logger = logging.getLogger(__name__)
 class TranscriptionEngine:
     """One-shot transcription engine for a single video.
 
-    Extracts the full audio, transcribes it in one pass, and writes the
-    subtitle file. Audio extraction and model loading run in parallel.
+    Extracts the full audio, transcribes it in one pass via the Cohere +
+    stable-ts pipeline, and writes the ASS subtitle file.
     """
 
     def __init__(
@@ -54,10 +53,6 @@ class TranscriptionEngine:
             on_update=on_subtitle_update,
         )
 
-        self._refiner: QwenRefiner | None = None
-        if config.refinement.enabled:
-            self._refiner = QwenRefiner(config.refinement)
-
         self._stop_event = threading.Event()
         self._finished_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
@@ -89,21 +84,16 @@ class TranscriptionEngine:
         """Stop the engine and clean up resources."""
         logger.info(f"{self._log_prefix} Stopping engine")
         self._stop_event.set()
-
-        # Kill FFmpeg before joining — otherwise the worker is blocked
-        # waiting for audio and the join always times out.
         self._audio.close()
-
         if self._worker_thread:
             self._worker_thread.join(timeout=5.0)
-
         logger.info(f"{self._log_prefix} Engine stopped")
 
     def _worker(self) -> None:
         """Worker thread: wait for model + audio → transcribe → write subtitles."""
         logger.info(f"{self._log_prefix} Worker started")
         try:
-            # Wait for transcription model (interruptible — checks stop every 1s).
+            # Wait for transcription model (interruptible).
             if not self.transcriber.is_loaded:
                 logger.info(f"{self._log_prefix} Waiting for transcription model...")
                 while not self.transcriber.is_loaded and not self._stop_event.is_set():
@@ -141,27 +131,11 @@ class TranscriptionEngine:
             if result.is_empty:
                 logger.info(f"{self._log_prefix} No speech detected ({elapsed:.1f}s)")
             else:
-                count = self._subtitle_writer.add_words(result.words, time_offset=0.0)
-                logger.info(f"{self._log_prefix} Done: {count} segments in {elapsed:.1f}s")
-                self._subtitle_writer.write()
+                self._subtitle_writer.write_ass(result.ass_content)
+                logger.info(f"{self._log_prefix} Done in {elapsed:.1f}s")
 
             if self.on_progress:
                 self.on_progress(1, 1)
-
-            # Optional post-transcription refinement
-            if not self._stop_event.is_set() and self._refiner and not result.is_empty:
-                try:
-                    logger.info(f"{self._log_prefix} Starting refinement...")
-                    self.transcriber.close()
-                    self._refiner.load()
-                    count = self._subtitle_writer.refine(self._refiner)
-                    if count > 0:
-                        logger.info(f"{self._log_prefix} Refinement: {count} segments polished")
-                        self._subtitle_writer.write()
-                except Exception as e:
-                    logger.error(f"{self._log_prefix} Refinement failed: {e}", exc_info=True)
-                finally:
-                    self._refiner.close()
 
             logger.info(f"{self._log_prefix} Transcription complete!")
 
