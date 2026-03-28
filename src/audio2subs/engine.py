@@ -12,6 +12,7 @@ from audio2subs.audio import AudioExtractor
 from audio2subs.config import ServiceConfig
 from audio2subs.subtitle import SubtitleWriter, generate_subtitle_path
 from audio2subs.transcription.base import BaseTranscriber
+from audio2subs.utils.performance import Timer
 
 logger = logging.getLogger(__name__)
 
@@ -95,18 +96,20 @@ class TranscriptionEngine:
         try:
             # Wait for transcription model (interruptible).
             if not self.transcriber.is_loaded:
-                logger.info(f"{self._log_prefix} Waiting for transcription model...")
-                while not self.transcriber.is_loaded and not self._stop_event.is_set():
-                    self.transcriber.wait_for_load(timeout=1.0)
+                with Timer("Waiting for model load", logger):
+                    logger.info(f"{self._log_prefix} Waiting for transcription model...")
+                    while not self.transcriber.is_loaded and not self._stop_event.is_set():
+                        self.transcriber.wait_for_load(timeout=1.0)
 
             if self._stop_event.is_set() or not self.transcriber.is_loaded:
                 return
 
             # Wait for audio extraction (started in start(), interruptible).
             if not self._audio.is_ready:
-                logger.info(f"{self._log_prefix} Waiting for audio extraction...")
-                while not self._audio.is_ready and not self._stop_event.is_set():
-                    self._audio.wait_for_completion(timeout=1.0)
+                with Timer("Waiting for audio extraction", logger):
+                    logger.info(f"{self._log_prefix} Waiting for audio extraction...")
+                    while not self._audio.is_ready and not self._stop_event.is_set():
+                        self._audio.wait_for_completion(timeout=1.0)
 
             if self._stop_event.is_set():
                 return
@@ -121,18 +124,20 @@ class TranscriptionEngine:
                 f"{self._log_prefix} Transcribing {self.duration:.1f}s "
                 f"({len(audio_data) // 1024}KB)..."
             )
-            start_perf = time.perf_counter()
-            result = self.transcriber.transcribe(audio_data)
-            elapsed = time.perf_counter() - start_perf
+            
+            # The transcriber already has internal timers, but we'll add a top-level one here too
+            # for the engine's perspective of the full "transcription call".
+            with Timer(f"Total Engine Processing: {self.video_filename}", logger, duration=self.duration):
+                result = self.transcriber.transcribe(audio_data)
 
             if self._stop_event.is_set():
                 return
 
             if result.is_empty:
-                logger.info(f"{self._log_prefix} No speech detected ({elapsed:.1f}s)")
+                logger.info(f"{self._log_prefix} No speech detected")
             else:
                 self._subtitle_writer.write_ass(result.ass_content)
-                logger.info(f"{self._log_prefix} Done in {elapsed:.1f}s")
+                logger.info(f"{self._log_prefix} Done")
 
             if self.on_progress:
                 self.on_progress(1, 1)

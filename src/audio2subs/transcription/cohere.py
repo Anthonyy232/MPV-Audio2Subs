@@ -14,6 +14,7 @@ from audio2subs.transcription.base import (
     TranscriptionResult,
     SAMPLE_RATE,
 )
+from audio2subs.utils.performance import Timer
 
 logger = logging.getLogger(__name__)
 
@@ -79,22 +80,22 @@ class CohereTranscriber(BaseTranscriber):
                     device = "cpu"
 
             # --- Cohere ASR ---
-            logger.info(f"Loading Cohere ASR on {device} ({dtype})")
-            self._processor = AutoProcessor.from_pretrained(self.config.model_name)
-            self._model = CohereAsrForConditionalGeneration.from_pretrained(
-                self.config.model_name,
-                device_map="auto",
-                torch_dtype=dtype,
-            )
+            with Timer(f"Loading Cohere ASR ({self.config.model_name})", logger):
+                self._processor = AutoProcessor.from_pretrained(self.config.model_name)
+                self._model = CohereAsrForConditionalGeneration.from_pretrained(
+                    self.config.model_name,
+                    device_map="auto",
+                    torch_dtype=dtype,
+                )
 
             # --- stable-ts aligner (tiny Whisper, CPU) ---
-            logger.info(f"Loading stable-ts aligner (base.en) on {device}")
-            self._aligner = stable_whisper.load_model("base.en", device=device)
+            with Timer("Loading stable-ts aligner (base.en)", logger):
+                self._aligner = stable_whisper.load_model("base.en", device=device)
 
             # --- Silero VAD (CPU, ~2MB) ---
-            logger.info("Loading Silero VAD")
-            from silero_vad import load_silero_vad
-            self._vad = load_silero_vad()
+            with Timer("Loading Silero VAD", logger):
+                from silero_vad import load_silero_vad
+                self._vad = load_silero_vad()
 
             self._is_loaded = True
             self._loaded_event.set()
@@ -123,18 +124,21 @@ class CohereTranscriber(BaseTranscriber):
             return TranscriptionResult()
 
         try:
-            audio_float = self._pcm_to_float(audio_buffer)
+            audio_duration = len(audio_buffer) / (SAMPLE_RATE * 2)  # 16-bit PCM Mono
+            
+            with Timer("Full Transcription Pipeline", logger, duration=audio_duration):
+                audio_float = self._pcm_to_float(audio_buffer)
 
-            # Cohere ASR → plain text (VAD applied internally)
-            text = self._run_cohere(audio_float)
-            if not text:
-                logger.debug("Cohere returned no text")
-                return TranscriptionResult()
+                # Cohere ASR → plain text (VAD applied internally)
+                text = self._run_cohere(audio_float)
+                if not text:
+                    logger.debug("Cohere returned no text")
+                    return TranscriptionResult()
 
-            # stable-ts pipeline → ASS subtitle content
-            ass_content = self._run_stable_ts(audio_float, text)
+                # stable-ts pipeline → ASS subtitle content
+                ass_content = self._run_stable_ts(audio_float, text)
 
-            return TranscriptionResult(full_text=text.strip(), ass_content=ass_content)
+                return TranscriptionResult(full_text=text.strip(), ass_content=ass_content)
 
         except Exception as e:
             logger.error(f"Cohere transcription failed: {e}", exc_info=True)
@@ -152,15 +156,16 @@ class CohereTranscriber(BaseTranscriber):
         """Zero out non-speech regions using Silero VAD."""
         from silero_vad import get_speech_timestamps
 
-        speech_timestamps = get_speech_timestamps(
-            audio_float,
-            self._vad,
-            sampling_rate=SAMPLE_RATE,
-            threshold=0.35,
-            min_speech_duration_ms=250,
-            min_silence_duration_ms=500,
-            speech_pad_ms=100,
-        )
+        with Timer("Silero VAD", logger, duration=len(audio_float) / SAMPLE_RATE):
+            speech_timestamps = get_speech_timestamps(
+                audio_float,
+                self._vad,
+                sampling_rate=SAMPLE_RATE,
+                threshold=0.35,
+                min_speech_duration_ms=250,
+                min_silence_duration_ms=500,
+                speech_pad_ms=100,
+            )
 
         if not speech_timestamps:
             logger.debug("VAD: no speech detected")
@@ -196,19 +201,21 @@ class CohereTranscriber(BaseTranscriber):
         audio_chunk_index = inputs.get("audio_chunk_index")
         inputs = inputs.to(self._model.device, dtype=self._model.dtype)
 
-        with torch.inference_mode():
-            output_ids = self._model.generate(**inputs, max_new_tokens=256)
+        duration = len(audio_float) / SAMPLE_RATE
+        with Timer("Cohere ASR Inference", logger, duration=duration):
+            with torch.inference_mode():
+                output_ids = self._model.generate(**inputs, max_new_tokens=256)
 
-        if audio_chunk_index is not None:
-            result = self._processor.decode(
-                output_ids,
-                skip_special_tokens=True,
-                audio_chunk_index=audio_chunk_index,
-                language=language,
-            )
-            text = result[0] if isinstance(result, list) else result
-        else:
-            text = self._processor.decode(output_ids, skip_special_tokens=True)
+            if audio_chunk_index is not None:
+                result = self._processor.decode(
+                    output_ids,
+                    skip_special_tokens=True,
+                    audio_chunk_index=audio_chunk_index,
+                    language=language,
+                )
+                text = result[0] if isinstance(result, list) else result
+            else:
+                text = self._processor.decode(output_ids, skip_special_tokens=True)
 
         return text.strip()
 
@@ -220,18 +227,20 @@ class CohereTranscriber(BaseTranscriber):
         """
         language = self.config.language
 
+        duration = len(audio_float) / SAMPLE_RATE
         # --- Forced alignment ---
         try:
-            result = self._aligner.align(
-                audio_float,
-                text,
-                language=language,
-                vad=True,
-                verbose=None,
-                regroup=False,
-                remove_instant_words=True,
-                aligner="new",
-            )
+            with Timer("stable-ts align()", logger, duration=duration):
+                result = self._aligner.align(
+                    audio_float,
+                    text,
+                    language=language,
+                    vad=True,
+                    verbose=None,
+                    regroup=False,
+                    remove_instant_words=True,
+                    aligner="new",
+                )
         except Exception as e:
             logger.error(f"stable-ts align() failed: {e}", exc_info=True)
             return ""
@@ -244,7 +253,8 @@ class CohereTranscriber(BaseTranscriber):
         result.segments = [s for s in result.segments if (s.end - s.start) > 0.03]
 
         try:
-            self._aligner.refine(audio_float, result, only_voice_freq=True, verbose=None)
+            with Timer("stable-ts refine()", logger, duration=duration):
+                self._aligner.refine(audio_float, result, only_voice_freq=True, verbose=None)
         except Exception as e:
             logger.warning(f"stable-ts refine() failed, using unrefined: {e}")
 

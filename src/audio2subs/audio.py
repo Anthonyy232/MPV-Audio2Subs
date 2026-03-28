@@ -13,6 +13,7 @@ from typing import BinaryIO
 
 from audio2subs.exceptions import AudioExtractionError
 from audio2subs.transcription.base import SAMPLE_RATE, CHANNELS
+from audio2subs.utils.performance import Timer
 
 logger = logging.getLogger(__name__)
 
@@ -139,33 +140,34 @@ class AudioExtractor:
         filename = os.path.basename(self.video_path)
         logger.info(f"Extracting audio from '{filename}'...")
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            creationflags=creationflags,
-        )
-        self._ffmpeg_process = process
+        with Timer(f"Audio extraction from {filename}", logger, duration=self.duration):
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=creationflags,
+            )
+            self._ffmpeg_process = process
 
-        try:
-            start_time = time.time()
-            while process.poll() is None:
-                if time.time() - start_time > timeout:
+            try:
+                start_time = time.time()
+                while process.poll() is None:
+                    if time.time() - start_time > timeout:
+                        process.kill()
+                        raise AudioExtractionError(f"FFmpeg timed out after {timeout}s for {filename}")
+                    time.sleep(0.1)
+
+                if process.returncode != 0:
+                    stderr = process.stderr.read().decode(errors="ignore") if process.stderr else ""
+                    raise AudioExtractionError(
+                        f"FFmpeg exited with code {process.returncode}",
+                        stderr=stderr,
+                    )
+            finally:
+                if process.poll() is None:
                     process.kill()
-                    raise AudioExtractionError(f"FFmpeg timed out after {timeout}s for {filename}")
-                time.sleep(0.1)
-
-            if process.returncode != 0:
-                stderr = process.stderr.read().decode(errors="ignore") if process.stderr else ""
-                raise AudioExtractionError(
-                    f"FFmpeg exited with code {process.returncode}",
-                    stderr=stderr,
-                )
-        finally:
-            if process.poll() is None:
-                process.kill()
-            if process.stderr:
-                process.stderr.close()
+                if process.stderr:
+                    process.stderr.close()
 
         logger.info("Audio extraction complete")
 

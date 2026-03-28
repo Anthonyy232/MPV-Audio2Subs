@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Callable
 
 from audio2subs.config import SubtitleConfig
@@ -68,16 +69,22 @@ class SubtitleWriter:
             raise
 
     def _inject_playres(self, ass_content: str) -> str:
-        """Inject PlayResX/PlayResY into the [Script Info] section."""
+        """Replace or inject PlayResX/PlayResY in the [Script Info] section.
+
+        stable_whisper's to_ass() emits default PlayRes stubs (384x288).
+        We strip any existing PlayRes lines first so the real video dimensions
+        are the only ones present — preventing MPV from picking the wrong value.
+        """
+        # Remove any pre-existing PlayRes lines (stable_whisper default stubs)
+        ass_content = re.sub(r"(?m)^PlayRes[XY]:.*\r?\n?", "", ass_content)
+
         playres = f"PlayResX: {self.video_width}\nPlayResY: {self.video_height}"
-        # Insert after [Script Info] header line
         if "[Script Info]" in ass_content:
             return ass_content.replace(
                 "[Script Info]",
                 f"[Script Info]\n{playres}",
                 1,
             )
-        # Fallback: prepend
         return f"[Script Info]\n{playres}\n{ass_content}"
 
     def _build_header(self) -> str:
