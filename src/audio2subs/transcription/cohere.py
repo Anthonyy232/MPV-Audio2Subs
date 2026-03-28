@@ -88,8 +88,8 @@ class CohereTranscriber(BaseTranscriber):
             )
 
             # --- stable-ts aligner (tiny Whisper, CPU) ---
-            logger.info("Loading stable-ts aligner (base.en) on cpu")
-            self._aligner = stable_whisper.load_model("base.en", device="cpu")
+            logger.info(f"Loading stable-ts aligner (base.en) on {device}")
+            self._aligner = stable_whisper.load_model("base.en", device=device)
 
             # --- Silero VAD (CPU, ~2MB) ---
             logger.info("Loading Silero VAD")
@@ -156,7 +156,7 @@ class CohereTranscriber(BaseTranscriber):
             audio_float,
             self._vad,
             sampling_rate=SAMPLE_RATE,
-            threshold=0.5,
+            threshold=0.35,
             min_speech_duration_ms=250,
             min_silence_duration_ms=500,
             speech_pad_ms=100,
@@ -240,8 +240,11 @@ class CohereTranscriber(BaseTranscriber):
             return ""
 
         # --- Refine timestamps (iterative muting for precise boundaries) ---
+        # Ensure all segments meet the minimum processing duration Whisper needs (approx 30ms)
+        result.segments = [s for s in result.segments if (s.end - s.start) > 0.03]
+
         try:
-            self._aligner.refine(audio_float, result, word_level=False, only_voice_freq=True, verbose=None)
+            self._aligner.refine(audio_float, result, only_voice_freq=True, verbose=None)
         except Exception as e:
             logger.warning(f"stable-ts refine() failed, using unrefined: {e}")
 
