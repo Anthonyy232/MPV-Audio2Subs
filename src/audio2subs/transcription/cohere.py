@@ -241,7 +241,7 @@ class CohereTranscriber(BaseTranscriber):
 
         # --- Refine timestamps (iterative muting for precise boundaries) ---
         try:
-            self._aligner.refine(audio_float, result, verbose=None)
+            self._aligner.refine(audio_float, result, word_level=False, only_voice_freq=True, verbose=None)
         except Exception as e:
             logger.warning(f"stable-ts refine() failed, using unrefined: {e}")
 
