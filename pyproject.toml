@@ -23,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 asr = [
     "transformers>=5.4.0",
+    "accelerate",
     "torch",
     "soundfile",
     "librosa",

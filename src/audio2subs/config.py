@@ -35,7 +35,7 @@ class TranscriptionConfig:
 class RefinementConfig:
     """Configuration for LLM-based subtitle refinement."""
 
-    enabled: bool = True
+    enabled: bool = False
     model_name: str = "Qwen/Qwen3-1.7B"
     device: Literal["cuda", "cpu", "auto"] = "auto"
     enable_thinking: bool = False  # Default to False for speed, True for better reasoning

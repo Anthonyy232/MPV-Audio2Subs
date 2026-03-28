@@ -5,6 +5,7 @@ portalocker
 
 # ASR dependencies — install with: pip install -e ".[asr]"
 # transformers>=5.4.0
+# accelerate
 # torch
 # soundfile
 # librosa
