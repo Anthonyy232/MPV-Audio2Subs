@@ -225,8 +225,6 @@ class CohereTranscriber(BaseTranscriber):
 
         return text.strip()
 
-        return text.strip()
-
     def _run_stable_ts(self, audio_float: np.ndarray, text: str) -> str:
         """Run the full stable-ts pipeline and return ASS subtitle content.
 
