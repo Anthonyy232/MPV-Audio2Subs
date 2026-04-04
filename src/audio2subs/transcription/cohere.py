@@ -84,9 +84,8 @@ class CohereTranscriber(BaseTranscriber):
                 self._processor = AutoProcessor.from_pretrained(self.config.model_name)
                 self._model = CohereAsrForConditionalGeneration.from_pretrained(
                     self.config.model_name,
-                    device_map="auto",
                     torch_dtype=dtype,
-                )
+                ).to(device)
 
             # --- stable-ts aligner (tiny Whisper, CPU) ---
             with Timer("Loading stable-ts aligner (base.en)", logger):
@@ -209,7 +208,8 @@ class CohereTranscriber(BaseTranscriber):
 
             with Timer("ASR Generation (Inference)", logger):
                 with torch.inference_mode():
-                    output_ids = self._model.generate(**inputs, max_new_tokens=256)
+                    max_tokens = max(256, int(duration * 14))
+                    output_ids = self._model.generate(**inputs, max_new_tokens=max_tokens)
 
             with Timer("ASR Decoding (IDs -> Text)", logger):
                 if audio_chunk_index is not None:

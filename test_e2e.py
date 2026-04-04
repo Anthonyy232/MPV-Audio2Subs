@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import sys
 import time
 import os
@@ -12,14 +13,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from audio2subs.config import ServiceConfig
 from audio2subs.engine import TranscriptionEngine
-from audio2subs.transcription import QwenTranscriber
+from audio2subs.transcription import CohereTranscriber
 
-VIDEO_PATH = (
-    r"C:\Users\Antho\patreon-dl\PixelPodYT - Pixel Pod"
-    r"\posts\108516229 - Frieren Beyond Journey's End - Ep 1 ReactionReview"
-    r"\video\331502946.mp4"
-)
-DURATION = 1852.236032
+VIDEO_PATH = r"C:\Users\Antho\Videos\2026-02-23 14-00-40.mp4"
+
+
+def _get_duration(path: str) -> float:
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    return float(result.stdout.strip())
 
 
 def main() -> None:
@@ -35,12 +40,15 @@ def main() -> None:
     config = ServiceConfig()
     # Use default chunk duration (30 s)
 
-    transcriber = QwenTranscriber(config.transcription)
+    transcriber = CohereTranscriber(config.transcription, config.subtitle)
 
     # Load model up front so timing is clear
     logging.info("Loading ASR model...")
     transcriber.load()
     logging.info("ASR model loaded.")
+
+    duration = _get_duration(VIDEO_PATH)
+    logging.info(f"Video duration: {duration:.1f}s")
 
     subtitle_path = os.path.splitext(VIDEO_PATH)[0] + ".ai.ass"
 
@@ -50,7 +58,7 @@ def main() -> None:
 
     engine = TranscriptionEngine(
         video_path=VIDEO_PATH,
-        duration=DURATION,
+        duration=duration,
         transcriber=transcriber,
         config=config,
         video_width=1920,
@@ -67,7 +75,6 @@ def main() -> None:
 
     try:
         while not engine.is_finished:
-            done, total = engine.progress
             time.sleep(5)
         logging.info("Engine finished.")
     except KeyboardInterrupt:
