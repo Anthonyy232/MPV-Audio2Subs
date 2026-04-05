@@ -1,6 +1,6 @@
 # MPV-Audio2Subs: Real-Time AI Local Subtitles for MPV
 
-Generate high-quality, time-aligned subtitles for any video on the fly using local ASR with Qwen3-ASR.
+Generate high-quality, time-aligned subtitles for any video on the fly using local ASR with Cohere Transcribe.
 
 ## ✨ Features
 
@@ -28,12 +28,19 @@ This installs the Python AI engine globally so you only need `main.lua` in your 
 
 1. **Install the AI engine:**
 ```bash
-# Using uv (Recommended - installs with optional ASR dependencies)
-uv tool install "audio2subs[asr] @ git+https://github.com/Anthonyy232/MPV-Audio2Subs.git" --extra-index-url https://download.pytorch.org/whl/cu128
+# Using uv (Recommended)
+# IMPORTANT: --extra-index-url is required for CUDA-enabled PyTorch.
+# Without it, uv installs CPU-only torch and transcription will be ~30x slower.
+uv tool install "audio2subs[asr-fast] @ git+https://github.com/Anthonyy232/MPV-Audio2Subs.git" --extra-index-url https://download.pytorch.org/whl/cu128
 
-# OR using pipx
-pipx install "git+https://github.com/Anthonyy232/MPV-Audio2Subs.git#egg=audio2subs[asr]"
+# OR using pipx (you must install CUDA torch separately)
+pipx install "git+https://github.com/Anthonyy232/MPV-Audio2Subs.git#egg=audio2subs[asr-fast]"
 ```
+
+> **CPU-only**: If you don't have an NVIDIA GPU, omit `--extra-index-url`:
+> ```bash
+> uv tool install "audio2subs[asr-fast] @ git+https://github.com/Anthonyy232/MPV-Audio2Subs.git"
+> ```
 
 2. **Install the MPV script:**
 Download `main.lua` and place it in your MPV scripts folder (e.g., as `audio2subs.lua`).
@@ -77,9 +84,8 @@ MPV-Audio2Subs/
 │   ├── config.py         # Configuration dataclasses
 │   └── transcription/    # ASR backends
 │       ├── base.py       # Interface
-│       └── qwen.py       # Qwen3-ASR backend
-├── pyproject.toml        # Modern packaging
-└── requirements.txt
+│       └── cohere.py     # Cohere Transcribe + stable-ts backend
+└── pyproject.toml        # Modern packaging
 ```
 
 ## ⚡ Flash Attention 2 (Optional, Recommended)
@@ -112,24 +118,22 @@ Once installed, the service auto-detects it — you'll see `Flash Attention 2 en
 ## ⚙️ Configuration
 
 Environment variables:
-- `AUDIO2SUBS_CHUNK_DURATION` - Chunk size in seconds (default: 30)
-- `AUDIO2SUBS_PERSISTENT_MODE` - Keep model in memory (1/true)
 - `AUDIO2SUBS_CPU_ONLY` - Force CPU mode (1/true)
 
 ## 🛠️ Troubleshooting
 
 **Model Load Failures**
-- Check `subtitle_service.log` for details
-- Ensure dependencies are installed correctly (`pip install qwen-asr`)
+- Check logs in `%APPDATA%\MPV-Audio2Subs\` (Windows) or `~/.local/state/mpv-audio2subs/` (Linux/macOS)
+- Ensure dependencies are installed correctly
 
 **No Subtitles Appearing**
 - Verify MPV IPC is configured correctly
 - Check that FFmpeg can read the video
 
 **Slow Performance**
-- Verify CUDA is available and your versions with the command above
-- Install Flash Attention 2 (see above)
-- Check `subtitle_service.log` for `Flash Attention 2 enabled` to confirm it's active
+- Verify CUDA torch is installed (not CPU-only): `python -c "import torch; print(torch.cuda.is_available())"`
+- If it prints `False`, reinstall with `--extra-index-url https://download.pytorch.org/whl/cu128` (see installation above)
+- Install Flash Attention 2 (see above) for additional speedup
 
 ## 🔒 Privacy
 
